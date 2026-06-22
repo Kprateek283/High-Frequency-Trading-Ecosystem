@@ -1,0 +1,9 @@
+build/
+*.log
+*.bin
+.vscode/
+compile_commands.json
+.cache/
+.venv/
+__pycache__/
+old_notes/
