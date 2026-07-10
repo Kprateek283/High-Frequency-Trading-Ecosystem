@@ -66,19 +66,29 @@ private:
         }
     }
 
+    // Finds the lowest set ask price >= start_price, or -1 if none.
     inline int32_t find_next_ask(uint32_t start_price) {
+        const uint32_t num_l2 = MAX_PRICE / 4096 + 1;
         uint32_t word_idx = start_price >> 6;
+
+        // 1. Remainder of the starting L1 word (bits at/above start_price).
         uint64_t word = asks_bitmap[word_idx] & (~0ULL << (start_price & 63));
         if (word) return (word_idx << 6) + __builtin_ctzll(word);
 
+        // 2. Following L1 words within the current L2 group. Mask keeps bits
+        //    strictly above (word_idx & 63); guarded against shift-by-64 UB and
+        //    against wrongly re-selecting the current word at the group boundary.
         uint32_t l2_word_idx = word_idx >> 6;
-        uint64_t l2_word = asks_l2[l2_word_idx] & (~0ULL << ((word_idx + 1) & 63));
+        uint32_t bit_in_l2 = word_idx & 63;
+        uint64_t l2_mask = (bit_in_l2 == 63) ? 0ULL : (~0ULL << (bit_in_l2 + 1));
+        uint64_t l2_word = asks_l2[l2_word_idx] & l2_mask;
         if (l2_word) {
             uint32_t next_word_idx = (l2_word_idx << 6) + __builtin_ctzll(l2_word);
             return (next_word_idx << 6) + __builtin_ctzll(asks_bitmap[next_word_idx]);
         }
 
-        for (uint32_t i = l2_word_idx + 1; i < (MAX_PRICE / 4096 + 1); ++i) {
+        // 3. Following L2 groups.
+        for (uint32_t i = l2_word_idx + 1; i < num_l2; ++i) {
             if (asks_l2[i]) {
                 uint32_t next_word_idx = (i << 6) + __builtin_ctzll(asks_l2[i]);
                 return (next_word_idx << 6) + __builtin_ctzll(asks_bitmap[next_word_idx]);
@@ -87,18 +97,27 @@ private:
         return -1;
     }
 
+    // Finds the highest set bid price <= start_price, or -1 if none.
     inline int32_t find_next_bid(uint32_t start_price) {
         int32_t word_idx = (int32_t)(start_price >> 6);
+
+        // 1. Remainder of the starting L1 word (bits at/below start_price).
         uint64_t word = bids_bitmap[word_idx] & (~0ULL >> (63 - (start_price & 63)));
         if (word) return (word_idx << 6) + (63 - __builtin_clzll(word));
 
+        // 2. Preceding L1 words within the current L2 group. Mask keeps bits
+        //    strictly below (word_idx & 63); guarded against shift-by-64 UB and
+        //    against wrongly re-selecting the current word at the group boundary.
         int32_t l2_word_idx = word_idx >> 6;
-        uint64_t l2_word = bids_l2[l2_word_idx] & (~0ULL >> (63 - ((word_idx - 1) & 63)));
+        uint32_t bit_in_l2 = (uint32_t)word_idx & 63;
+        uint64_t l2_mask = (bit_in_l2 == 0) ? 0ULL : (~0ULL >> (64 - bit_in_l2));
+        uint64_t l2_word = bids_l2[l2_word_idx] & l2_mask;
         if (l2_word) {
             uint32_t next_word_idx = (l2_word_idx << 6) + (63 - __builtin_clzll(l2_word));
             return (next_word_idx << 6) + (63 - __builtin_clzll(bids_bitmap[next_word_idx]));
         }
 
+        // 3. Preceding L2 groups.
         for (int32_t i = l2_word_idx - 1; i >= 0; --i) {
             if (bids_l2[i]) {
                 uint32_t next_word_idx = (i << 6) + (63 - __builtin_clzll(bids_l2[i]));
