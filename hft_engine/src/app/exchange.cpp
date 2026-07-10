@@ -127,39 +127,40 @@ int main() {
 
     // Background monitor thread logic moved to MetricsAndOrderManager
 
-    try {
-        std::cout << "Gateway listening on port 9091. Press Ctrl+C to shutdown." << std::endl;
+    std::cout << "Gateway listening on port 9091. Press Ctrl+C to shutdown." << std::endl;
 
-        // 4. Wait for shutdown signal
-        while (g_running.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        
-        std::cout << "\nShutdown signal received. Capturing final stats..." << std::endl;
-        
-        TscTuple t;
-        for (int i = 0; i < NUM_SHARDS; ++i) {
-            while (tsc_queues[i]->pop(t)) {
-                timer.add_latency(t.egress - t.ingress);
-            }
-        }
-        
-        timer.printStats("Final Session Stats");
-        server.print_experiment_4_stats();
-        std::cout << "Engine Halted." << std::endl;
-        std::this_thread::sleep_for(std::chrono::seconds(1)); 
-    } catch (const std::exception& e) {
-        std::cerr << "Server Error: " << e.what() << std::endl;
+    // 4. Wait for shutdown signal
+    while (g_running.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // 5. Join threads
+    std::cout << "\nShutdown signal received. Joining threads..." << std::endl;
     g_running.store(false);
+
+    // 5. Join every producer/consumer of the shared queues BEFORE the final drain,
+    // so main is the sole accessor of tsc_queues below (the OrderManager also drains
+    // them, so draining here while it runs would be a multi-consumer SPSC violation
+    // and a race on the Timer).
     if (mkt_thread.joinable()) mkt_thread.join();
     for (int i = 0; i < NUM_SHARDS; ++i) {
         if (engine_threads[i].joinable()) engine_threads[i].join();
     }
     if (server_thread.joinable()) server_thread.join();
     if (om_thread.joinable()) om_thread.join();
+
+    // 6. Drain any latency samples the OrderManager didn't consume, then report.
+    TscTuple t;
+    for (int i = 0; i < NUM_SHARDS; ++i) {
+        while (tsc_queues[i]->pop(t)) {
+            timer.add_latency(t.egress - t.ingress);
+        }
+    }
+
+    timer.printStats("Final Session Stats");
+    server.print_experiment_4_stats();
+    std::cout << "\nMarket-data reports dropped (ITCH queue full): "
+              << g_stats.dropped_reports.load(std::memory_order_relaxed) << std::endl;
+    std::cout << "Engine Halted." << std::endl;
 
     return 0;
 }
