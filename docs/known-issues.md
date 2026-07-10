@@ -184,13 +184,27 @@ many entries are valid. (Fix tracked as §5 in the prep doc.)
 
 ## [LOW] `g_stats.dropped_reports` is counted but never reported
 
+> ✅ **RESOLVED** (this branch). `g_stats.dropped_reports` is now printed in the final
+> shutdown stats (`app/exchange.cpp`). Full machine-readable export still lands with the
+> stats region (prep doc §4).
+
 Market-data reports dropped when the ITCH queue is full are counted
 (`matching/orderbook.h:118`) but the value is never printed or exported. Silent data
 loss in the market-data feed is invisible. (Surface it via the stats region — prep doc §4.)
 
 ---
 
-## [LOW] Publisher overwrites match-time timestamp with send-time timestamp
+## [LOW] Publisher timestamp: dead match-time write
+
+> ✅ **RESOLVED** (this branch), with a sharper diagnosis than originally written.
+> `ItchMessage::timestamp` is the **exchange send time** by design — the firm reads it as
+> `t1_exchange_send` to measure send→receive latency
+> (`hft-trading-firm/.../LocalExchangeConnector.h:314`), and the Publisher stamps it at
+> send time (`publisher.h:54`). So the send-time write is intentional and consumed; the
+> real defect was that `broadcast` also wrote an `rdtsc` into that field at match time
+> (`orderbook.h`), which was **always overwritten before send** — a dead write on the hot
+> matching path. That write is removed. (If event/match time is ever needed by consumers,
+> add a separate `egress_tsc` field per prep doc §3 rather than reusing this one.)
 
 `ItchMessage::timestamp` is set at match time in `broadcast` (`orderbook.h:116`) then
 unconditionally overwritten with a send-time `RDTSCP` in the Publisher
@@ -200,6 +214,11 @@ unconditionally overwritten with a send-time `RDTSCP` in the Publisher
 ---
 
 ## [LOW] Shutdown race on `Timer`
+
+> ✅ **RESOLVED** (this branch). This was actually more than a benign Timer race: `main`
+> and the still-running `OrderManager` both `pop()` the `tsc_queues`, which is a
+> multi-consumer SPSC violation. Shutdown now joins every producer/consumer thread
+> **before** the final drain, so `main` is the sole accessor (`app/exchange.cpp`).
 
 At shutdown, `main` drains the TSC queues and calls `timer.add_latency` while the
 `OrderManager` thread may still be doing the same (`app/exchange.cpp:123-128` vs
@@ -212,6 +231,11 @@ data race on the sample buffer, but it can double-count or drop a few final samp
 ---
 
 ## [LOW] Duplicated protocol header will drift
+
+> ✅ **MITIGATED** (this branch). Both copies now carry matching
+> `static_assert(sizeof(...) == N)` wire-layout guards, so any divergence fails the build
+> instead of silently corrupting decoded messages. Full consolidation into one canonical
+> header is still tracked as prep doc §1.
 
 `ItchMessage` / `OuchEnterOrder` are defined identically in two files
 (`hft_engine/src/protocol/messages.h` and `hft-trading-firm/src/network/messages.h`).
