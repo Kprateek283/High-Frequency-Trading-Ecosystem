@@ -139,7 +139,9 @@ private:
     LockFreeQueue<DropCopyMessage, 1048576>* drop_copy_queue = nullptr;
 
     inline void broadcast(char type, uint64_t internal_id, uint64_t price, uint32_t qty, uint16_t inst, char side) {
-        ItchMessage report = {type, inst, 0, __builtin_ia32_rdtsc(), internal_id, qty, price, side};
+        // timestamp is (re)stamped at send time by the Publisher (that send time is
+        // what consumers use as t1_exchange_send), so don't waste an rdtsc here.
+        ItchMessage report = {type, inst, 0, 0, internal_id, qty, price, side};
         if (!mkt_data_queue->push(report)) {
             g_stats.dropped_reports.fetch_add(1, std::memory_order_relaxed);
         }
