@@ -149,6 +149,11 @@ scheme decoupled from lifetime order count.
 
 ## [MED] Connection limit of 1024 fds, silently dropped
 
+> ✅ **RESOLVED** (this branch). The fixed `ClientState[MAX_FDS*threads]` array is gone;
+> each worker keeps a `std::unordered_map<int, ClientState>` keyed by the raw fd (state
+> created on accept, erased on close), so there is no `MAX_FDS` cap. `TCPServer` also
+> raises `RLIMIT_NOFILE` soft→hard at startup. Fixed together with the ClientState item below.
+
 `accept()` rejects and closes any `client_fd >= MAX_FDS` (1024) per worker
 (`tcp_server.h:19`, `:165-168`). On a busy host, fds climb past 1024 quickly (the
 process's own listen/udp/epoll/mmap fds count too), so real client connections get
@@ -160,6 +165,14 @@ sized structure keyed by fd, and raise/inspect `RLIMIT_NOFILE`.
 ---
 
 ## [MED] `ClientState` is 128 KB × 1024 × threads — large, sparse, and reset on overflow
+
+> ✅ **RESOLVED** (this branch). `ClientState` is now allocated per live connection in
+> the per-worker map (not `MAX_FDS*threads` up front), and its buffer shrank from 128 KB
+> to 16 KB. The hard reset on buffer-full is replaced with fragment compaction at the top
+> of each read loop (`memmove` the unparsed bytes to the front, never discard), so framing
+> no longer desyncs; a fragment that somehow fills the whole buffer now drops the
+> connection instead of corrupting the stream. Verified: exact event counts held across a
+> 2M-msg/sec stream whose reads routinely split messages mid-frame.
 
 Each `ClientState` embeds a `char buffer[131072]` (`tcp_server.h:290`). The array is
 `MAX_FDS * num_threads` entries → 128 KB × 1024 = **128 MB per gateway thread**,
@@ -174,6 +187,14 @@ unparsed fragment instead of zeroing (the code already does the correct compacti
 ---
 
 ## [MED] Audit-log validity is only known on clean shutdown
+
+> ✅ **RESOLVED** (this branch). `order_audit.log` now begins with a fixed 64-byte
+> `AuditLogHeader` (magic, version, `entry_size`, and an atomic `write_index`). The
+> OrderManager release-stores `write_index` after every appended entry, so an external
+> reader (the Python monitor) can tail the log live and after a crash — it uses
+> `write_index`, not the file size. Verified: reading the header while the engine was
+> still running returned the exact committed count (1,256,000) even though the file was
+> still sized to full 20M capacity.
 
 `OrderManager` records `log_index` in process memory and writes it to the file (via
 `ftruncate`) **only in its destructor** (`auxiliary/order_manager.h:68`). A crash leaves

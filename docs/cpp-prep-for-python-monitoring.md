@@ -133,7 +133,20 @@ Notes:
 
 ---
 
-## 5. Make the audit log readable live and crash-safe
+## 5. Make the audit log readable live and crash-safe — ✅ DONE
+
+> **Implemented.** `order_audit.log` now starts with a fixed 64-byte `AuditLogHeader`
+> followed by the `OrderLogEntry[]` array:
+> ```
+> offset 0  : uint64  magic       = 0x00484654415544 01  ("HFTAUD" + version byte)
+> offset 8  : uint32  version     = 1
+> offset 12 : uint32  entry_size  = sizeof(OrderLogEntry)   // 64
+> offset 16 : uint64  write_index  (atomic, release-stored after each append)
+> offset 64 : OrderLogEntry[write_index] ...                // valid entries
+> ```
+> Python reader: `mmap` the file, check `magic`/`entry_size`, acquire-load `write_index`,
+> then read that many entries starting at offset 64. Works live and after a crash (the
+> count comes from `write_index`, never the file size). Original plan retained below.
 
 **Problem.** `order_audit.log` is an `mmap` of `OrderLogEntry[20M]`
 (`auxiliary/order_manager.h`). The valid entry count (`log_index`) lives only in
