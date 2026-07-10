@@ -8,6 +8,8 @@
 #include <cstring>
 #include <vector>
 #include <memory>
+#include <unordered_map>
+#include <sys/resource.h>
 #include <netinet/tcp.h>
 #include "core/lock_free_queue.h"
 #include "core/memory_pool.h"
@@ -42,7 +44,14 @@ public:
         if (num_threads < 1) num_threads = 1;
         if (num_threads > 16) num_threads = 16;
 
-        clients = std::make_unique<ClientState[]>(MAX_FDS * num_threads);
+        // Raise the open-fd soft limit toward the hard limit so the gateway isn't
+        // capped near the default ~1024 concurrent connections. Per-connection state
+        // is now created lazily on accept (see worker_loop), so there is no fixed cap.
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+            rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
 
         for (int i = 0; i < num_threads; ++i) {
             int l_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -151,8 +160,12 @@ public:
         int e_fd = epoll_fds[thread_id];
         int l_fd = listen_fds[thread_id];
         int u_fd = udp_fds[thread_id];
-        int fd_offset = thread_id * MAX_FDS; // Ensure unique indexes per thread for ClientState
-        
+
+        // Per-worker connection table keyed by raw fd. No fixed cap (removes the old
+        // 1024-fd limit) and no giant up-front allocation — state is created on accept
+        // and destroyed on close. Owned by this worker, so no cross-thread sharing.
+        std::unordered_map<int, ClientState> client_states;
+
         struct epoll_event events[64];
         while (running.load(std::memory_order_relaxed)) {
             unsigned aux;
@@ -166,28 +179,26 @@ public:
             for (int i = 0; i < nfds; ++i) {
                 if (events[i].data.fd == l_fd) {
                     int client_fd = accept(l_fd, NULL, NULL);
-                    if (client_fd < 0 || client_fd >= MAX_FDS) {
-                        if (client_fd >= 0) close(client_fd);
-                        continue;
-                    }
-                    
+                    if (client_fd < 0) continue;
+
                     int flags = fcntl(client_fd, F_GETFL, 0);
                     fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
-                    
+
                     int nodelay = 1;
                     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
                     int busy_poll = 50;
                     setsockopt(client_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll));
-                    
+
+                    client_states[client_fd]; // create per-connection buffer state
+
                     struct epoll_event ev;
                     ev.events = EPOLLIN | EPOLLET;
-                    // Tag the fd with offset to map into global clients array safely
-                    ev.data.fd = client_fd + fd_offset; 
+                    ev.data.fd = client_fd;
                     epoll_ctl(e_fd, EPOLL_CTL_ADD, client_fd, &ev);
                 } else if (events[i].data.fd == u_fd) {
                     handle_udp_client(u_fd, thread_id);
                 } else {
-                    handle_client(events[i].data.fd, events[i].data.fd - fd_offset, thread_id);
+                    handle_client(events[i].data.fd, client_states, thread_id);
                 }
             }
         }
@@ -293,27 +304,43 @@ private:
         }
     }
     struct ClientState {
-        char buffer[131072]; 
+        // Only ever holds at most one partial message plus a fresh read, so this is
+        // far larger than needed; kept generous for big batched reads. Allocated per
+        // live connection (not MAX_FDS up front).
+        char buffer[16384];
         size_t write_pos = 0;
         size_t read_pos = 0;
     };
-    
-    std::unique_ptr<ClientState[]> clients;
 
-    void handle_client(int global_fd, int local_fd, int worker_id) {
-        auto& state = clients[global_fd];
-        
+    void handle_client(int fd, std::unordered_map<int, ClientState>& states, int worker_id) {
+        auto it = states.find(fd);
+        if (it == states.end()) return;
+        ClientState& state = it->second;
+
         while (true) {
+            // Reclaim buffer space before each read: reset when fully consumed,
+            // otherwise compact the unparsed fragment to the front (never discard it,
+            // which the old hard-reset did and thereby desynced the framing).
+            if (state.read_pos == state.write_pos) {
+                state.read_pos = state.write_pos = 0;
+            } else if (state.read_pos > 0) {
+                size_t frag = state.write_pos - state.read_pos;
+                std::memmove(state.buffer, state.buffer + state.read_pos, frag);
+                state.write_pos = frag;
+                state.read_pos = 0;
+            }
             size_t remaining_space = sizeof(state.buffer) - state.write_pos;
             if (remaining_space == 0) {
-                state.read_pos = 0;
-                state.write_pos = 0;
-                remaining_space = sizeof(state.buffer);
+                // A single unparsed fragment fills the whole buffer => malformed /
+                // oversized framing. Drop the connection rather than corrupt the stream.
+                close(fd);
+                states.erase(fd);
+                return;
             }
 
             unsigned aux;
             uint64_t r1 = __rdtscp(&aux);
-            ssize_t n = read(local_fd, state.buffer + state.write_pos, remaining_space);
+            ssize_t n = read(fd, state.buffer + state.write_pos, remaining_space);
             uint64_t r2 = __rdtscp(&aux);
             uint64_t t5 = r2; // using r2 as t5
 
@@ -328,8 +355,8 @@ private:
                     if (msg_type == 'O') msg_size = sizeof(OuchEnterOrder);
                     else if (msg_type == 'X') msg_size = sizeof(OuchCancelOrder);
                     else {
-                        close(local_fd);
-                        std::memset(static_cast<void*>(&state), 0, sizeof(ClientState));
+                        close(fd);
+                        states.erase(fd);
                         return;
                     }
 
@@ -432,25 +459,17 @@ private:
                     }
                 }
                 
-                if (state.read_pos == state.write_pos) {
-                    state.read_pos = 0;
-                    state.write_pos = 0;
-                } else if (state.write_pos > sizeof(state.buffer) - 1024) {
-                    size_t fragment_size = state.write_pos - state.read_pos;
-                    std::memmove(state.buffer, state.buffer + state.read_pos, fragment_size);
-                    state.read_pos = 0;
-                    state.write_pos = fragment_size;
-                }
+                // Buffer reclamation happens at the top of the next loop iteration.
             } else if (n == 0) {
-                close(local_fd);
-                std::memset(static_cast<void*>(&state), 0, sizeof(ClientState));
-                break;
+                close(fd);
+                states.erase(fd);
+                return;
             } else {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    close(local_fd);
-                    std::memset(static_cast<void*>(&state), 0, sizeof(ClientState));
+                    close(fd);
+                    states.erase(fd);
                 }
-                break;
+                return; // EAGAIN: socket drained, keep the connection for next event
             }
         }
     }
