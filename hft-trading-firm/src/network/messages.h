@@ -61,3 +61,12 @@ struct ItchMessage {
 };
 
 #pragma pack(pop)
+
+// Wire-layout guards. These structs are the on-the-wire contract and are
+// duplicated in hft_engine/src/protocol/messages.h; both copies carry the same
+// asserts so any accidental divergence fails the build instead of silently
+// corrupting decoded messages. Do not change without versioning the protocol.
+static_assert(sizeof(OuchEnterOrder) == 81, "OuchEnterOrder wire layout changed");
+static_assert(sizeof(OuchCancelOrder) == 19, "OuchCancelOrder wire layout changed");
+static_assert(sizeof(OuchExecutionReport) == 32, "OuchExecutionReport wire layout changed");
+static_assert(sizeof(ItchMessage) == 34, "ItchMessage wire layout changed");
