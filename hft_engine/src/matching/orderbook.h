@@ -8,7 +8,14 @@
 #include "core/lock_free_queue.h"
 
 const uint32_t MAX_PRICE = 100001;
-const uint32_t MAX_ORDERS_LOOKUP = 20000001; 
+
+// Live orders per shard are bounded by the shard's memory pool, and each order's
+// internal_id IS its pool slot index. So orders_by_id only needs pool-capacity
+// entries (indexed [1, POOL_CAPACITY_PER_SHARD); slot 0 is the reserved null
+// handle). This is the single source of truth shared with the pool allocation in
+// exchange.cpp, and it means internal_ids recycle with pool slots and never exhaust.
+const uint32_t POOL_CAPACITY_PER_SHARD = 500000;
+const uint32_t MAX_ORDERS_LOOKUP = POOL_CAPACITY_PER_SHARD;
 
 class OrderBook {
 private:

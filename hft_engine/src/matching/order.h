@@ -26,7 +26,10 @@ struct alignas(32) EngineTask {
     MsgType type;
     union {
         Order* order;          // Used for MsgType::NEW
-        uint64_t internal_id;  // Used for MsgType::CANCEL
+        struct {
+            uint64_t internal_id;      // pool slot handle of the resting order
+            uint64_t client_order_id;  // validated against the slot's current owner
+        } cancel;                      // Used for MsgType::CANCEL
     };
     uint64_t ingress_tsc;
 };

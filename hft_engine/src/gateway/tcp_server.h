@@ -28,16 +28,20 @@ public:
     std::vector<int> epoll_fds;
     std::vector<std::thread> workers;
 
-    TCPServer(int port, std::array<std::unique_ptr<LockFreeQueue<EngineTask, 2097152>>, NUM_SHARDS>& qs, 
-              std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS>& dcqs,
-              std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS>& ps) 
-        : port(port), queues(qs), drop_copy_queues(dcqs), pools(ps) {
-        
-        const char* env_threads = std::getenv("GATEWAY_THREADS");
-        num_threads = env_threads ? std::atoi(env_threads) : 1;
+    // engine_qs[shard][worker] is the SPSC ingress queue owned by gateway worker
+    // `worker` into engine shard `shard`. reject_qs[worker] is that worker's
+    // SPSC reject-report queue (drained by the OrderManager). One producer per
+    // queue keeps LockFreeQueue's SPSC contract intact under a multi-threaded gateway.
+    TCPServer(int port, int threads,
+              std::array<std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>, NUM_SHARDS>& qs,
+              std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& reject_qs,
+              std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS>& ps)
+        : port(port), queues(qs), gw_reject_queues(reject_qs), pools(ps) {
+
+        num_threads = threads;
         if (num_threads < 1) num_threads = 1;
         if (num_threads > 16) num_threads = 16;
-        
+
         clients = std::make_unique<ClientState[]>(MAX_FDS * num_threads);
 
         for (int i = 0; i < num_threads; ++i) {
@@ -181,9 +185,9 @@ public:
                     ev.data.fd = client_fd + fd_offset; 
                     epoll_ctl(e_fd, EPOLL_CTL_ADD, client_fd, &ev);
                 } else if (events[i].data.fd == u_fd) {
-                    handle_udp_client(u_fd);
+                    handle_udp_client(u_fd, thread_id);
                 } else {
-                    handle_client(events[i].data.fd, events[i].data.fd - fd_offset);
+                    handle_client(events[i].data.fd, events[i].data.fd - fd_offset, thread_id);
                 }
             }
         }
@@ -202,7 +206,7 @@ public:
     }
 
 private:
-    void process_message(const char* buf, size_t len, uint64_t t5) {
+    void process_message(const char* buf, size_t len, uint64_t t5, int worker_id) {
         char msg_type = buf[0];
         if (msg_type == 'O') {
             if (len < sizeof(OuchEnterOrder)) return;
@@ -237,26 +241,27 @@ private:
             Side side = (req.side == 'B') ? Side::BUY : Side::SELL;
 
             if (!risk_engine.check_pre_trade(req, inst)) {
-                uint64_t internal_id = session_manager.assign_internal_id(client_id, inst);
-                uint16_t shard = inst % NUM_SHARDS;
-                DropCopyMessage drop_msg = {client_id, internal_id, req.price, req.shares, inst, OrderState::REJECTED, side};
-                drop_copy_queues[shard]->push(drop_msg);
+                // Rejected orders never enter the book, so they get no slot handle (id 0).
+                DropCopyMessage drop_msg = {client_id, 0, req.price, req.shares, inst, OrderState::REJECTED, side};
+                gw_reject_queues[worker_id]->push(drop_msg);
                 return;
             }
 
-            uint64_t internal_id = session_manager.assign_internal_id(client_id, inst);
             uint16_t shard = inst % NUM_SHARDS;
-            Order* o = pools[shard]->allocate(internal_id, client_id, req.price, req.shares, inst, side);
+            Order* o = pools[shard]->allocate(0, client_id, req.price, req.shares, inst, side);
+            uint32_t internal_id = pools[shard]->index_of(o); // pool slot IS the handle
+            o->internal_id = internal_id;
+            session_manager.record_order(client_id, internal_id, inst);
             EngineTask task;
             task.type = MsgType::NEW;
             task.order = o;
             task.ingress_tsc = get_tsc();
-            while (!queues[shard]->push(task)) { __builtin_ia32_pause(); }
+            while (!queues[shard][worker_id]->push(task)) { __builtin_ia32_pause(); }
         } else if (msg_type == 'X') {
             if (len < sizeof(OuchCancelOrder)) return;
             OuchCancelOrder req;
             std::memcpy(&req, buf, sizeof(OuchCancelOrder));
-            
+
             uint64_t client_id = 0;
             for(int j=0; j<14; ++j) {
                 if(req.order_token[j] >= '0' && req.order_token[j] <= '9') {
@@ -269,21 +274,22 @@ private:
                 uint16_t shard = data.instrument_id % NUM_SHARDS;
                 EngineTask task;
                 task.type = MsgType::CANCEL;
-                task.internal_id = data.internal_id; 
+                task.cancel.internal_id = data.internal_id;
+                task.cancel.client_order_id = client_id;
                 task.ingress_tsc = get_tsc();
-                while (!queues[shard]->push(task)) { __builtin_ia32_pause(); }
+                while (!queues[shard][worker_id]->push(task)) { __builtin_ia32_pause(); }
             }
         }
     }
 
-    void handle_udp_client(int udp_fd) {
+    void handle_udp_client(int udp_fd, int worker_id) {
         char buf[2048];
         while (true) {
             ssize_t n = recv(udp_fd, buf, sizeof(buf), MSG_DONTWAIT);
             if (n <= 0) break;
             unsigned aux;
             uint64_t t5 = __rdtscp(&aux);
-            process_message(buf, n, t5);
+            process_message(buf, n, t5, worker_id);
         }
     }
     struct ClientState {
@@ -294,7 +300,7 @@ private:
     
     std::unique_ptr<ClientState[]> clients;
 
-    void handle_client(int global_fd, int local_fd) {
+    void handle_client(int global_fd, int local_fd, int worker_id) {
         auto& state = clients[global_fd];
         
         while (true) {
@@ -365,10 +371,9 @@ private:
                         uint64_t v1 = __rdtscp(&aux);
 
                         if (!safe) {
-                            uint64_t internal_id = session_manager.assign_internal_id(client_id, inst);
-                            uint16_t shard = inst % NUM_SHARDS;
-                            DropCopyMessage drop_msg = {client_id, internal_id, req.price, req.shares, inst, OrderState::REJECTED, side};
-                            drop_copy_queues[shard]->push(drop_msg);
+                            // Rejected orders never enter the book (no slot handle, id 0).
+                            DropCopyMessage drop_msg = {client_id, 0, req.price, req.shares, inst, OrderState::REJECTED, side};
+                            gw_reject_queues[worker_id]->push(drop_msg);
                             state.read_pos += sizeof(OuchEnterOrder);
                             uint64_t e1 = __rdtscp(&aux);
                             total_decode_cycles.fetch_add(d2 - d1, std::memory_order_relaxed);
@@ -378,14 +383,16 @@ private:
                             continue;
                         }
 
-                        uint64_t internal_id = session_manager.assign_internal_id(client_id, inst);
                         uint16_t shard = inst % NUM_SHARDS;
-                        Order* o = pools[shard]->allocate(internal_id, client_id, req.price, req.shares, inst, side);
+                        Order* o = pools[shard]->allocate(0, client_id, req.price, req.shares, inst, side);
+                        uint32_t internal_id = pools[shard]->index_of(o); // pool slot IS the handle
+                        o->internal_id = internal_id;
+                        session_manager.record_order(client_id, internal_id, inst);
                         EngineTask task;
                         task.type = MsgType::NEW;
                         task.order = o;
                         task.ingress_tsc = get_tsc();
-                        while (!queues[shard]->push(task)) { __builtin_ia32_pause(); }
+                        while (!queues[shard][worker_id]->push(task)) { __builtin_ia32_pause(); }
                         state.read_pos += sizeof(OuchEnterOrder);
 
                         uint64_t e1 = __rdtscp(&aux);
@@ -412,9 +419,10 @@ private:
                             uint16_t shard = data.instrument_id % NUM_SHARDS;
                             EngineTask task;
                             task.type = MsgType::CANCEL;
-                            task.internal_id = data.internal_id; 
+                            task.cancel.internal_id = data.internal_id;
+                            task.cancel.client_order_id = client_id;
                             task.ingress_tsc = get_tsc();
-                            while (!queues[shard]->push(task)) { __builtin_ia32_pause(); }
+                            while (!queues[shard][worker_id]->push(task)) { __builtin_ia32_pause(); }
                         }
                         state.read_pos += sizeof(OuchCancelOrder);
                         uint64_t e1 = __rdtscp(&aux);
@@ -447,8 +455,8 @@ private:
         }
     }
 
-    std::array<std::unique_ptr<LockFreeQueue<EngineTask, 2097152>>, NUM_SHARDS>& queues;
-    std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS>& drop_copy_queues;
+    std::array<std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>, NUM_SHARDS>& queues;
+    std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& gw_reject_queues;
     std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS>& pools;
     RiskEngine risk_engine;
     SessionManager session_manager;
