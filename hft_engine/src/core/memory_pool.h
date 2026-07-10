@@ -17,16 +17,26 @@
 template<typename T>
 class MemoryPool {
 private:
-    T* pool;                      
+    T* pool;
     LockFreeQueue<uint32_t, 16777216> recycle_queue; // 16M power-of-two
-    
-    uint32_t pool_capacity;       
-    uint32_t high_water_mark;     
+
+    uint32_t pool_capacity;
+    uint32_t high_water_mark;
+
+    // Serializes the allocation fast-path only. Multiple SO_REUSEPORT gateway
+    // workers can allocate from the same shard pool concurrently, so the
+    // high_water bump and the recycle_queue pop (an SPSC ring with a single
+    // producer = the engine's deallocate) must not race across consumers.
+    // The engine's deallocate() stays lock-free; only allocate() takes this.
+    std::atomic_flag alloc_lock = ATOMIC_FLAG_INIT;
 
 public:
-    explicit MemoryPool(uint32_t capacity) 
-        : pool_capacity(capacity), high_water_mark(0) {
-        
+    // NOTE: slot index 0 is reserved as the "null handle" sentinel so that an
+    // internal_id / order handle of 0 unambiguously means "no order". Valid slot
+    // indices therefore start at 1, hence high_water_mark starts at 1.
+    explicit MemoryPool(uint32_t capacity)
+        : pool_capacity(capacity), high_water_mark(1) {
+
         size_t size = sizeof(T) * capacity;
         
         // MAP_HUGETLB requires the size to be a multiple of the huge page size (typically 2MB)
@@ -63,6 +73,9 @@ public:
 
     template<typename... Args>
     T* allocate(Args&&... args) {
+        while (alloc_lock.test_and_set(std::memory_order_acquire)) {
+            __builtin_ia32_pause();
+        }
         uint32_t index;
         if (recycle_queue.pop(index)) {
             // Reused!
@@ -71,9 +84,13 @@ public:
             if (next < pool_capacity) [[likely]] {
                 index = next;
             } else {
+                alloc_lock.clear(std::memory_order_release);
                 throw std::runtime_error("Memory Pool exhausted!");
             }
         }
+        alloc_lock.clear(std::memory_order_release);
+        // Construction is outside the lock: `index` is now uniquely owned by
+        // this caller, so no other thread can touch pool[index].
         return new (&pool[index]) T(std::forward<Args>(args)...);
     }
 
@@ -83,4 +100,13 @@ public:
             __builtin_ia32_pause();
         }
     }
+
+    // Slot index of a live pointer; used as the order's internal_id handle.
+    inline uint32_t index_of(const T* ptr) const {
+        return static_cast<uint32_t>(ptr - pool);
+    }
+
+    // Approximate number of slots ever handed out (for monitoring / headroom).
+    inline uint32_t slots_used() const { return high_water_mark; }
+    inline uint32_t capacity() const { return pool_capacity; }
 };

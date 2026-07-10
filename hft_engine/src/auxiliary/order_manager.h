@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <vector>
 #include <thread>
 #include <atomic>
 #include <memory>
@@ -22,6 +23,7 @@ template<int NUM_SHARDS>
 class OrderManager {
 private:
     std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS>& drop_copy_queues;
+    std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& gw_reject_queues;
     std::array<std::unique_ptr<LockFreeQueue<TscTuple, 1048576>>, NUM_SHARDS>& tsc_queues;
     Timer& timer;
     std::atomic<bool>& running;
@@ -36,11 +38,12 @@ private:
     uint64_t rejects = 0;
 
 public:
-    OrderManager(std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS>& dcq, 
+    OrderManager(std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS>& dcq,
+                 std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& reject_qs,
                  std::array<std::unique_ptr<LockFreeQueue<TscTuple, 1048576>>, NUM_SHARDS>& tq,
                  Timer& tmr,
-                 std::atomic<bool>& r) 
-        : drop_copy_queues(dcq), tsc_queues(tq), timer(tmr), running(r) {
+                 std::atomic<bool>& r)
+        : drop_copy_queues(dcq), gw_reject_queues(reject_qs), tsc_queues(tq), timer(tmr), running(r) {
         
         fd = open("order_audit.log", O_RDWR | O_CREAT | O_TRUNC, 0666);
         if (fd == -1) {
@@ -81,22 +84,29 @@ public:
         while (running.load(std::memory_order_relaxed)) {
             bool found = false;
             
-            // 1. Drain Drop Copy Queues
-            for (int i = 0; i < NUM_SHARDS; ++i) {
-                while (drop_copy_queues[i]->pop(msg)) {
-                    found = true;
-                    if (log_index < MAX_LOG_ENTRIES) {
-                        mmap_log[log_index].timestamp_tsc = __builtin_ia32_rdtsc();
-                        mmap_log[log_index].msg = msg;
-                        log_index++;
-                    }
-                    
-                    if (msg.state == OrderState::NEW) new_orders++;
-                    else if (msg.state == OrderState::FILLED || msg.state == OrderState::PARTIAL_FILL) trades++;
-                    else if (msg.state == OrderState::REJECTED) rejects++;
+            // 1. Drain Drop Copy Queues (engine-produced: NEW / FILL / CANCEL)
+            //    and the per-worker gateway reject queues (pre-trade REJECTED).
+            //    Each queue has exactly one producer, preserving the SPSC contract.
+            auto consume = [&](DropCopyMessage& m) {
+                found = true;
+                if (log_index < MAX_LOG_ENTRIES) {
+                    mmap_log[log_index].timestamp_tsc = __builtin_ia32_rdtsc();
+                    mmap_log[log_index].msg = m;
+                    log_index++;
                 }
+
+                if (m.state == OrderState::NEW) new_orders++;
+                else if (m.state == OrderState::FILLED || m.state == OrderState::PARTIAL_FILL) trades++;
+                else if (m.state == OrderState::REJECTED) rejects++;
+            };
+
+            for (int i = 0; i < NUM_SHARDS; ++i) {
+                while (drop_copy_queues[i]->pop(msg)) consume(msg);
             }
-            
+            for (auto& rq : gw_reject_queues) {
+                while (rq->pop(msg)) consume(msg);
+            }
+
             // 2. Drain TSC Queues for Latency Metrics
             for (int i = 0; i < NUM_SHARDS; ++i) {
                 while (tsc_queues[i]->pop(t)) {

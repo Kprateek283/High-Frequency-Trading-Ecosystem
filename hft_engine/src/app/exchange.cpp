@@ -4,6 +4,7 @@
 #include <iostream>
 #include <thread>
 #include <atomic>
+#include <cstdlib>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h> 
@@ -59,28 +60,44 @@ int main() {
 
     // 1. Instantiate Core Utilities
     constexpr int NUM_SHARDS = 4; // Restored to 4 for maximum HFT capacity
+
+    // Number of SO_REUSEPORT gateway workers. Each worker gets its own SPSC
+    // ingress queue into every shard (and its own reject queue) so that no
+    // LockFreeQueue ever has more than one producer.
+    const char* env_threads = std::getenv("GATEWAY_THREADS");
+    int num_gw = env_threads ? std::atoi(env_threads) : 1;
+    if (num_gw < 1) num_gw = 1;
+    if (num_gw > 16) num_gw = 16;
+
     std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS> pools;
     std::array<std::unique_ptr<LockFreeQueue<ItchMessage, 1048576>>, NUM_SHARDS> mkt_data_queues;
     std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS> drop_copy_queues;
-    std::array<std::unique_ptr<LockFreeQueue<EngineTask, 2097152>>, NUM_SHARDS> engine_queues;
+    std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>> gw_reject_queues; // one per gateway worker
+    std::array<std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>, NUM_SHARDS> engine_queues; // [shard][worker]
     std::array<std::unique_ptr<LockFreeQueue<TscTuple, 1048576>>, NUM_SHARDS> tsc_queues;
     std::array<std::unique_ptr<Engine>, NUM_SHARDS> engines;
 
+    for (int w = 0; w < num_gw; ++w) {
+        gw_reject_queues.push_back(std::make_unique<LockFreeQueue<DropCopyMessage, 1048576>>());
+    }
+
     for (int i = 0; i < NUM_SHARDS; ++i) {
-        pools[i] = std::make_unique<MemoryPool<Order>>(500000); // 500k per shard -> 2M total
+        pools[i] = std::make_unique<MemoryPool<Order>>(POOL_CAPACITY_PER_SHARD); // must match orders_by_id size
         mkt_data_queues[i] = std::make_unique<LockFreeQueue<ItchMessage, 1048576>>();
         drop_copy_queues[i] = std::make_unique<LockFreeQueue<DropCopyMessage, 1048576>>();
-        engine_queues[i] = std::make_unique<LockFreeQueue<EngineTask, 2097152>>();
         tsc_queues[i] = std::make_unique<LockFreeQueue<TscTuple, 1048576>>();
-        engines[i] = std::make_unique<Engine>(i, *pools[i], *mkt_data_queues[i], *drop_copy_queues[i], *engine_queues[i], *tsc_queues[i], g_running);
+        for (int w = 0; w < num_gw; ++w) {
+            engine_queues[i].push_back(std::make_unique<LockFreeQueue<EngineTask, 524288>>());
+        }
+        engines[i] = std::make_unique<Engine>(i, *pools[i], *mkt_data_queues[i], *drop_copy_queues[i], engine_queues[i], *tsc_queues[i], g_running);
     }
-    
+
     Timer timer(TOTAL_ORDERS_EXPECTED);
 
     // 2. Instantiate Business Logic Components
     Publisher mkt_publisher(mkt_data_queues, g_running);
-    OrderManager<NUM_SHARDS> order_manager(drop_copy_queues, tsc_queues, timer, g_running);
-    TCPServer server(9091, engine_queues, drop_copy_queues, pools);
+    OrderManager<NUM_SHARDS> order_manager(drop_copy_queues, gw_reject_queues, tsc_queues, timer, g_running);
+    TCPServer server(9091, num_gw, engine_queues, gw_reject_queues, pools);
 
     // 3. Spawn Threads and Pin to Isolated Cores
     std::thread mkt_thread([&]() { 
