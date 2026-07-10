@@ -19,6 +19,21 @@ struct OrderLogEntry {
     DropCopyMessage msg;
 };
 
+// Fixed 64-byte header at the start of order_audit.log. write_index is published
+// after every appended entry, so an external reader (e.g. the Python monitor) can
+// tail the log while the engine runs, and it survives a crash — unlike the old
+// scheme where the valid count was only written to the file size on clean shutdown.
+constexpr uint64_t AUDIT_LOG_MAGIC = 0x48465441554401ULL; // "HFTAUD" + version byte
+struct alignas(64) AuditLogHeader {
+    uint64_t magic;                    // AUDIT_LOG_MAGIC
+    uint32_t version;                  // format version
+    uint32_t entry_size;              // sizeof(OrderLogEntry), for reader self-check
+    std::atomic<uint64_t> write_index; // count of valid entries committed so far
+};
+static_assert(sizeof(AuditLogHeader) == 64, "AuditLogHeader must be exactly one cache line");
+static_assert(alignof(OrderLogEntry) <= 64 && (64 % alignof(OrderLogEntry)) == 0,
+              "entries must stay aligned when placed right after the header");
+
 template<int NUM_SHARDS>
 class OrderManager {
 private:
@@ -29,7 +44,9 @@ private:
     std::atomic<bool>& running;
     
     int fd;
-    OrderLogEntry* mmap_log;
+    void* mmap_base = MAP_FAILED;
+    AuditLogHeader* header = nullptr;
+    OrderLogEntry* mmap_entries = nullptr;
     size_t log_index = 0;
     const size_t MAX_LOG_ENTRIES = 20000000; // 20 million events capacity
 
@@ -49,26 +66,36 @@ public:
         if (fd == -1) {
             throw std::runtime_error("Failed to open order audit log");
         }
-        
-        size_t size = MAX_LOG_ENTRIES * sizeof(OrderLogEntry);
-        if (ftruncate(fd, size) != 0) {
+
+        size_t total = sizeof(AuditLogHeader) + MAX_LOG_ENTRIES * sizeof(OrderLogEntry);
+        if (ftruncate(fd, total) != 0) {
             close(fd);
             throw std::runtime_error("Failed to set size for order audit log");
         }
-        
-        mmap_log = (OrderLogEntry*)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (mmap_log == MAP_FAILED) {
+
+        mmap_base = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mmap_base == MAP_FAILED) {
             close(fd);
             throw std::runtime_error("Failed to mmap order audit log");
         }
+        header = reinterpret_cast<AuditLogHeader*>(mmap_base);
+        mmap_entries = reinterpret_cast<OrderLogEntry*>(
+            reinterpret_cast<char*>(mmap_base) + sizeof(AuditLogHeader));
+
+        header->magic = AUDIT_LOG_MAGIC;
+        header->version = 1;
+        header->entry_size = sizeof(OrderLogEntry);
+        header->write_index.store(0, std::memory_order_release);
     }
-    
+
     ~OrderManager() {
-        if (mmap_log != MAP_FAILED) {
-            munmap(mmap_log, MAX_LOG_ENTRIES * sizeof(OrderLogEntry));
+        size_t total = sizeof(AuditLogHeader) + MAX_LOG_ENTRIES * sizeof(OrderLogEntry);
+        if (mmap_base != MAP_FAILED) {
+            munmap(mmap_base, total);
         }
         if (fd != -1) {
-            ftruncate(fd, log_index * sizeof(OrderLogEntry));
+            // Trim to header + the entries actually written (readers use write_index).
+            ftruncate(fd, sizeof(AuditLogHeader) + log_index * sizeof(OrderLogEntry));
             close(fd);
         }
     }
@@ -90,9 +117,12 @@ public:
             auto consume = [&](DropCopyMessage& m) {
                 found = true;
                 if (log_index < MAX_LOG_ENTRIES) {
-                    mmap_log[log_index].timestamp_tsc = __builtin_ia32_rdtsc();
-                    mmap_log[log_index].msg = m;
+                    mmap_entries[log_index].timestamp_tsc = __builtin_ia32_rdtsc();
+                    mmap_entries[log_index].msg = m;
                     log_index++;
+                    // Publish the entry (release) so a reader that acquire-loads
+                    // write_index sees fully-written entry data below it.
+                    header->write_index.store(log_index, std::memory_order_release);
                 }
 
                 if (m.state == OrderState::NEW) new_orders++;
