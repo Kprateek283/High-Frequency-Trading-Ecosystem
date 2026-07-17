@@ -1,6 +1,15 @@
 #pragma once
 #include <cstdint>
 
+// The single source of truth for every on-the-wire structure in the ecosystem.
+// Both the engine and hft-trading-firm include THIS file; there is no second copy.
+//
+// Bump PROTOCOL_VERSION in the same commit as any change to a packed struct
+// below, and update both the static_asserts at the bottom of this file and
+// monitoring/wire.py. The stats region (prep-doc §4) publishes this constant so
+// Python can assert it is decoding a build it understands.
+inline constexpr uint32_t PROTOCOL_VERSION = 1;
+
 enum class Side : uint8_t { BUY, SELL };
 enum class MsgType : uint8_t { NEW, CANCEL };
 enum class ReportType : uint8_t { FILL, CANCEL, ADD, REJECT };
@@ -38,6 +47,15 @@ struct OuchCancelOrder {
     uint32_t shares;
 }; // 19 bytes
 
+struct OuchExecutionReport {
+    char msg_type;           // 'E'
+    char order_token[14];
+    uint32_t executed_shares;
+    uint32_t execution_price;
+    char liquidity_flag;     // 'A' (Added) or 'R' (Removed)
+    char match_number[8];
+}; // 32 bytes
+
 // --- ITCH 5.0 Outbound Market Data Protocol ---
 
 struct ItchMessage {
@@ -53,10 +71,10 @@ struct ItchMessage {
 
 #pragma pack(pop)
 
-// Wire-layout guards. These structs are the on-the-wire contract and are
-// duplicated in hft-trading-firm/src/network/messages.h; both copies carry the
-// same asserts so any accidental divergence fails the build instead of silently
-// corrupting decoded messages. Do not change without versioning the protocol.
+// Wire-layout guards. These structs are the on-the-wire contract; any accidental
+// change to a size fails the build instead of silently corrupting decoded
+// messages. Do not change without bumping PROTOCOL_VERSION above.
 static_assert(sizeof(OuchEnterOrder) == 81, "OuchEnterOrder wire layout changed");
 static_assert(sizeof(OuchCancelOrder) == 19, "OuchCancelOrder wire layout changed");
+static_assert(sizeof(OuchExecutionReport) == 32, "OuchExecutionReport wire layout changed");
 static_assert(sizeof(ItchMessage) == 34, "ItchMessage wire layout changed");
