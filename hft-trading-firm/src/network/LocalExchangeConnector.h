@@ -11,7 +11,7 @@
 #include "../../include/network/IExchangeConnector.h"
 #include "tcp_client.h"
 #include "udp_listener.h"
-#include "messages.h"
+#include "protocol/messages.h"   // canonical wire schema, from hft_engine/src
 #include "../utils/spsc_queue.h"
 
 extern std::atomic<bool> global_running;
