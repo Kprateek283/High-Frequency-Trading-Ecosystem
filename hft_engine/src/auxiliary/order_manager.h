@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include "core/lock_free_queue.h"
 #include "matching/order.h"
+#include "matching/engine.h"   // TscTuple, used in the queue members below
 
 #include "core/timer.h"
 

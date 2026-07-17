@@ -303,6 +303,7 @@ private:
             process_message(buf, n, t5, worker_id);
         }
     }
+public:
     struct ClientState {
         // Only ever holds at most one partial message plus a fresh read, so this is
         // far larger than needed; kept generous for big batched reads. Allocated per
@@ -312,6 +313,8 @@ private:
         size_t read_pos = 0;
     };
 
+    // Public only so the framing tests can drive it over a socketpair without a
+    // live listener; in production only worker_loop calls it.
     void handle_client(int fd, std::unordered_map<int, ClientState>& states, int worker_id) {
         auto it = states.find(fd);
         if (it == states.end()) return;
@@ -474,6 +477,7 @@ private:
         }
     }
 
+private:
     std::array<std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>, NUM_SHARDS>& queues;
     std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& gw_reject_queues;
     std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS>& pools;
