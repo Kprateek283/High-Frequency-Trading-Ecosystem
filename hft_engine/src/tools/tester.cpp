@@ -29,8 +29,6 @@ int main() {
     std::vector<OuchEnterOrder> orders(TOTAL_ORDERS);
     std::memset(orders.data(), 0, TOTAL_ORDERS * sizeof(OuchEnterOrder));
 
-    const char* stocks[4] = {"AAPL    ", "MSFT    ", "GOOG    ", "AMZN    "};
-
     for (int i = 0; i < TOTAL_ORDERS; ++i) {
         orders[i].msg_type = 'O';
         std::string token = std::to_string(i + 1);

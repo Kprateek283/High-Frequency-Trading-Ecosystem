@@ -95,7 +95,11 @@ public:
         }
         if (fd != -1) {
             // Trim to header + the entries actually written (readers use write_index).
-            ftruncate(fd, sizeof(AuditLogHeader) + log_index * sizeof(OrderLogEntry));
+            // Best-effort: a failed trim leaves trailing zeroed entries, which readers
+            // already ignore because they bound their scan by write_index.
+            if (ftruncate(fd, sizeof(AuditLogHeader) + log_index * sizeof(OrderLogEntry)) != 0) {
+                perror("ftruncate(order_audit.log)");
+            }
             close(fd);
         }
     }

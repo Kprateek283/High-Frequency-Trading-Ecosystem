@@ -479,12 +479,4 @@ private:
     std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS>& pools;
     RiskEngine risk_engine;
     SessionManager session_manager;
-    
-    // We parse "AAPL    " as a 64-bit uint64_t for instantaneous symbol matching
-    const uint64_t supported_stocks[4] = {
-        *reinterpret_cast<const uint64_t*>("AAPL    "),
-        *reinterpret_cast<const uint64_t*>("MSFT    "),
-        *reinterpret_cast<const uint64_t*>("GOOG    "),
-        *reinterpret_cast<const uint64_t*>("AMZN    ")
-    };
 };
