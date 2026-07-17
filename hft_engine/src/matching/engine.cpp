@@ -9,7 +9,7 @@ Engine::Engine(uint16_t shard_id, MemoryPool<Order>& pool, LockFreeQueue<ItchMes
                LockFreeQueue<DropCopyMessage, 1048576>& drop_copy_queue,
                std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>& engine_queues_for_shard,
                LockFreeQueue<TscTuple, 1048576>& tsc_q, std::atomic<bool>& running_flag)
-    : tsc_queue(tsc_q), running(running_flag), total_processed(0) {
+    : tsc_queue(tsc_q), running(running_flag) {
 
     orders_by_id.fill(nullptr);
 
@@ -56,8 +56,6 @@ void Engine::run() {
 
             TscTuple t = {task.ingress_tsc, get_tsc()};
             while (!tsc_queue.push(t)) { __builtin_ia32_pause(); }
-
-            total_processed++;
         }
 
         if (!found) {

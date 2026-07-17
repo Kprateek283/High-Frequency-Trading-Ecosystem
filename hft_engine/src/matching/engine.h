@@ -27,11 +27,7 @@ public:
 
     void run();
 
-    uint64_t get_total_processed() const {
-        return total_processed;
-    }
 private:
-    alignas(64) uint64_t total_processed;
     std::array<Order*, MAX_ORDERS_LOOKUP> orders_by_id;
     std::array<OrderBook, MAX_INSTRUMENTS> books;
     std::vector<LockFreeQueue<EngineTask, 524288>*> queues; // one per gateway worker
