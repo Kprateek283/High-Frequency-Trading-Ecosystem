@@ -6,7 +6,9 @@
 #include "matching/orderbook.h"
 #include "core/lock_free_queue.h"
 
-const uint16_t MAX_INSTRUMENTS = 256;
+// MAX_INSTRUMENTS comes from protocol/messages.h (via orderbook.h -> order.h):
+// the gateway's decode, the risk engine's range check, and this shard's book
+// array must all agree on the cap, so exactly one header defines it.
 
 struct TscTuple {
     uint64_t ingress;

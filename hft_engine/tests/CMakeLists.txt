@@ -1,6 +1,7 @@
 add_executable(engine_tests
     main.cpp
     test_wire.cpp
+    test_symbol.cpp
     test_queue.cpp
     test_orderbook.cpp
     test_framing.cpp

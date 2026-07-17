@@ -270,15 +270,8 @@ public:
                             }
                         }
 
-                        uint16_t inst = 999;
-                        if (req.stock[0] == 'S' && req.stock[1] == 'T' && req.stock[2] == 'K') {
-                            inst = (req.stock[3] - '0') * 10000 +
-                                   (req.stock[4] - '0') * 1000 +
-                                   (req.stock[5] - '0') * 100 +
-                                   (req.stock[6] - '0') * 10 +
-                                   (req.stock[7] - '0');
-                        }
-                        
+                        uint16_t inst = decode_symbol(req.stock);
+
                         Side side = (req.side == 'B') ? Side::BUY : Side::SELL;
                         uint64_t d2 = __rdtscp(&aux);
 
