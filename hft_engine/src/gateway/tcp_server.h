@@ -18,7 +18,6 @@
 #include "gateway/risk_engine.h"
 #include "gateway/session_manager.h"
 
-const int MAX_FDS = 1024;
 constexpr int NUM_SHARDS = 4;
 
 class TCPServer {
@@ -26,7 +25,6 @@ public:
     int port;
     int num_threads;
     std::vector<int> listen_fds;
-    std::vector<int> udp_fds;
     std::vector<int> epoll_fds;
     std::vector<std::thread> workers;
 
@@ -77,35 +75,12 @@ public:
             }
             listen_fds.push_back(l_fd);
 
-            int u_fd = socket(AF_INET, SOCK_DGRAM, 0);
-            setsockopt(u_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-            setsockopt(u_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)); // CRITICAL for sharding
-            setsockopt(u_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll));
-            int udp_flags = fcntl(u_fd, F_GETFL, 0);
-            fcntl(u_fd, F_SETFL, udp_flags | O_NONBLOCK);
-
-            struct sockaddr_in udp_addr;
-            std::memset(&udp_addr, 0, sizeof(udp_addr));
-            udp_addr.sin_family = AF_INET;
-            udp_addr.sin_addr.s_addr = INADDR_ANY;
-            udp_addr.sin_port = htons(port + 1); // 9092
-            
-            if (bind(u_fd, (struct sockaddr*)&udp_addr, sizeof(udp_addr)) < 0) {
-                throw std::runtime_error("Failed to bind UDP to port " + std::to_string(port + 1));
-            }
-            udp_fds.push_back(u_fd);
-
             int e_fd = epoll_create1(0);
             struct epoll_event ev;
             ev.events = EPOLLIN;
             ev.data.fd = l_fd;
             epoll_ctl(e_fd, EPOLL_CTL_ADD, l_fd, &ev);
-            
-            struct epoll_event ev_udp;
-            ev_udp.events = EPOLLIN | EPOLLET;
-            ev_udp.data.fd = u_fd;
-            epoll_ctl(e_fd, EPOLL_CTL_ADD, u_fd, &ev_udp);
-            
+
             epoll_fds.push_back(e_fd);
         }
     }
@@ -159,7 +134,6 @@ public:
     void worker_loop(int thread_id, std::atomic<bool>& running) {
         int e_fd = epoll_fds[thread_id];
         int l_fd = listen_fds[thread_id];
-        int u_fd = udp_fds[thread_id];
 
         // Per-worker connection table keyed by raw fd. No fixed cap (removes the old
         // 1024-fd limit) and no giant up-front allocation — state is created on accept
@@ -195,8 +169,6 @@ public:
                     ev.events = EPOLLIN | EPOLLET;
                     ev.data.fd = client_fd;
                     epoll_ctl(e_fd, EPOLL_CTL_ADD, client_fd, &ev);
-                } else if (events[i].data.fd == u_fd) {
-                    handle_udp_client(u_fd, thread_id);
                 } else {
                     handle_client(events[i].data.fd, client_states, thread_id);
                 }
@@ -216,98 +188,11 @@ public:
         }
     }
 
-private:
-    void process_message(const char* buf, size_t len, uint64_t t5, int worker_id) {
-        char msg_type = buf[0];
-        if (msg_type == 'O') {
-            if (len < sizeof(OuchEnterOrder)) return;
-            OuchEnterOrder req;
-            std::memcpy(&req, buf, sizeof(OuchEnterOrder));
-            
-            if (req.t1_exchange_send != 0 && req.t2_trading_recv != 0 && req.t3_trading_enq != 0 && req.t4_network_deq != 0) {
-                total_udp += (req.t2_trading_recv - req.t1_exchange_send);
-                total_trading += (req.t3_trading_enq - req.t2_trading_recv);
-                total_q += (req.t4_network_deq - req.t3_trading_enq);
-                total_tcp += (t5 - req.t4_network_deq);
-                total_e2e += (t5 - req.t1_exchange_send);
-                num_samples++;
-            }
-            
-            uint64_t client_id = 0;
-            for(int j=0; j<14; ++j) {
-                if(req.order_token[j] >= '0' && req.order_token[j] <= '9') {
-                    client_id = client_id * 10 + (req.order_token[j] - '0');
-                }
-            }
-
-            uint16_t inst = 999;
-            if (req.stock[0] == 'S' && req.stock[1] == 'T' && req.stock[2] == 'K') {
-                inst = (req.stock[3] - '0') * 10000 +
-                       (req.stock[4] - '0') * 1000 +
-                       (req.stock[5] - '0') * 100 +
-                       (req.stock[6] - '0') * 10 +
-                       (req.stock[7] - '0');
-            }
-            
-            Side side = (req.side == 'B') ? Side::BUY : Side::SELL;
-
-            if (!risk_engine.check_pre_trade(req, inst)) {
-                // Rejected orders never enter the book, so they get no slot handle (id 0).
-                DropCopyMessage drop_msg = {client_id, 0, req.price, req.shares, inst, OrderState::REJECTED, side};
-                gw_reject_queues[worker_id]->push(drop_msg);
-                return;
-            }
-
-            uint16_t shard = inst % NUM_SHARDS;
-            Order* o = pools[shard]->allocate(0, client_id, req.price, req.shares, inst, side);
-            uint32_t internal_id = pools[shard]->index_of(o); // pool slot IS the handle
-            o->internal_id = internal_id;
-            session_manager.record_order(client_id, internal_id, inst);
-            EngineTask task;
-            task.type = MsgType::NEW;
-            task.order = o;
-            task.ingress_tsc = get_tsc();
-            while (!queues[shard][worker_id]->push(task)) { __builtin_ia32_pause(); }
-        } else if (msg_type == 'X') {
-            if (len < sizeof(OuchCancelOrder)) return;
-            OuchCancelOrder req;
-            std::memcpy(&req, buf, sizeof(OuchCancelOrder));
-
-            uint64_t client_id = 0;
-            for(int j=0; j<14; ++j) {
-                if(req.order_token[j] >= '0' && req.order_token[j] <= '9') {
-                    client_id = client_id * 10 + (req.order_token[j] - '0');
-                }
-            }
-
-            OrderSessionData data = session_manager.lookup_data(client_id);
-            if (data.internal_id != 0) [[likely]] {
-                uint16_t shard = data.instrument_id % NUM_SHARDS;
-                EngineTask task;
-                task.type = MsgType::CANCEL;
-                task.cancel.internal_id = data.internal_id;
-                task.cancel.client_order_id = client_id;
-                task.ingress_tsc = get_tsc();
-                while (!queues[shard][worker_id]->push(task)) { __builtin_ia32_pause(); }
-            }
-        }
-    }
-
-    void handle_udp_client(int udp_fd, int worker_id) {
-        char buf[2048];
-        while (true) {
-            ssize_t n = recv(udp_fd, buf, sizeof(buf), MSG_DONTWAIT);
-            if (n <= 0) break;
-            unsigned aux;
-            uint64_t t5 = __rdtscp(&aux);
-            process_message(buf, n, t5, worker_id);
-        }
-    }
 public:
     struct ClientState {
         // Only ever holds at most one partial message plus a fresh read, so this is
         // far larger than needed; kept generous for big batched reads. Allocated per
-        // live connection (not MAX_FDS up front).
+        // live connection, so there is no fixed connection cap.
         char buffer[16384];
         size_t write_pos = 0;
         size_t read_pos = 0;

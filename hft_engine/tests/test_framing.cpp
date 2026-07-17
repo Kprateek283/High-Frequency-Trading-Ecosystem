@@ -63,7 +63,6 @@ struct GatewayFixture {
         // it here if it is still open.
         if (server_fd >= 0 && fcntl(server_fd, F_GETFD) != -1) close(server_fd);
         for (int fd : server->listen_fds) close(fd);
-        for (int fd : server->udp_fds) close(fd);
         for (int fd : server->epoll_fds) close(fd);
     }
 
