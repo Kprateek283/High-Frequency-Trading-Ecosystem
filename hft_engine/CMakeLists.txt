@@ -29,3 +29,5 @@ foreach(target exchange tester market_maker generate_pcap replay)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Werror -Wpedantic)
     target_link_libraries(${target} PRIVATE Threads::Threads)
 endforeach()
+
+add_subdirectory(tests)
