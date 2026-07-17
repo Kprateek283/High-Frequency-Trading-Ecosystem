@@ -51,6 +51,29 @@ inline uint16_t decode_symbol(const char* stock) {
     return static_cast<uint16_t>(id);
 }
 
+// --- Order tokens ---
+//
+// OUCH says order_token is an opaque, client-chosen value that the exchange
+// echoes back. It identifies an ORDER (it is how a client cancels one); it is
+// NOT a client identity — the gateway assigns that from the connection.
+//
+// This exchange additionally requires the token to be 14 ASCII digits. The old
+// decode instead walked the field keeping only the digits, so "ABC00001" and
+// "00001XYZ" both collapsed to 1 and silently became the same order (review
+// A6). Requiring the full field to be numeric turns that silent collision into
+// an explicit rejection; all in-repo clients already zero-pad decimal tokens.
+inline constexpr uint64_t INVALID_ORDER_TOKEN = 0xFFFFFFFFFFFFFFFFULL;
+
+inline uint64_t decode_order_token(const char* token) {
+    uint64_t value = 0;
+    for (int i = 0; i < 14; ++i) {
+        const char c = token[i];
+        if (c < '0' || c > '9') return INVALID_ORDER_TOKEN;
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+    }
+    return value;
+}
+
 // Writes the canonical 8-byte wire symbol for `inst`. Every client uses this
 // rather than a hand-rolled literal; that is the whole point of the pair.
 inline void encode_symbol(char* stock, uint16_t inst) {

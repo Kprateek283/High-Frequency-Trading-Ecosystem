@@ -163,7 +163,11 @@ public:
                     int busy_poll = 50;
                     setsockopt(client_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll));
 
-                    client_states[client_fd]; // create per-connection buffer state
+                    // Identity is assigned here, from the connection, and never
+                    // from a client-controlled field. Ids start at 1 so that 0
+                    // stays available as "no client" in the session map.
+                    client_states[client_fd].client_id =
+                        next_client_id.fetch_add(1, std::memory_order_relaxed);
 
                     struct epoll_event ev;
                     ev.events = EPOLLIN | EPOLLET;
@@ -196,6 +200,9 @@ public:
         char buffer[16384];
         size_t write_pos = 0;
         size_t read_pos = 0;
+        // This connection's identity, assigned by the gateway on accept. Never
+        // derived from anything the client sends (review A6).
+        uint32_t client_id = 0;
     };
 
     // Public only so the framing tests can drive it over a socketpair without a
@@ -263,24 +270,30 @@ public:
                             num_samples++;
                         }
                         
-                        uint64_t client_id = 0;
-                        for(int j=0; j<14; ++j) {
-                            if(req.order_token[j] >= '0' && req.order_token[j] <= '9') {
-                                client_id = client_id * 10 + (req.order_token[j] - '0');
-                            }
-                        }
+                        // The token identifies the order; the connection
+                        // identifies the client. Never the other way round (A6).
+                        uint64_t order_token = decode_order_token(req.order_token);
+                        const uint32_t client_id = state.client_id;
 
                         uint16_t inst = decode_symbol(req.stock);
 
                         Side side = (req.side == 'B') ? Side::BUY : Side::SELL;
                         uint64_t d2 = __rdtscp(&aux);
 
-                        bool safe = risk_engine.check_pre_trade(req, inst);
+                        // A token that is not 14 digits, or that falls outside the
+                        // session map, cannot be registered — so its cancel could
+                        // never resolve. Reject it rather than accept an order the
+                        // client can never cancel.
+                        bool safe = order_token < SessionManager::MAX_CLIENT_ORDERS
+                                    && risk_engine.check_pre_trade(req, inst);
                         uint64_t v1 = __rdtscp(&aux);
 
                         if (!safe) {
                             // Rejected orders never enter the book (no slot handle, id 0).
-                            DropCopyMessage drop_msg = {client_id, 0, req.price, req.shares, inst, OrderState::REJECTED, side};
+                            // A malformed token reports back as 0; there is no
+                            // meaningful order id to echo.
+                            uint64_t echo = (order_token == INVALID_ORDER_TOKEN) ? 0 : order_token;
+                            DropCopyMessage drop_msg = {echo, 0, req.price, req.shares, inst, OrderState::REJECTED, side};
                             gw_reject_queues[worker_id]->push(drop_msg);
                             state.read_pos += sizeof(OuchEnterOrder);
                             uint64_t e1 = __rdtscp(&aux);
@@ -292,10 +305,10 @@ public:
                         }
 
                         uint16_t shard = inst % NUM_SHARDS;
-                        Order* o = pools[shard]->allocate(0, client_id, req.price, req.shares, inst, side);
+                        Order* o = pools[shard]->allocate(0, order_token, client_id, req.price, req.shares, inst, side);
                         uint32_t internal_id = pools[shard]->index_of(o); // pool slot IS the handle
                         o->internal_id = internal_id;
-                        session_manager.record_order(client_id, internal_id, inst);
+                        session_manager.record_order(order_token, internal_id, inst, client_id);
                         EngineTask task;
                         task.type = MsgType::NEW;
                         task.order = o;
@@ -313,22 +326,24 @@ public:
                         OuchCancelOrder req;
                         std::memcpy(&req, state.buffer + state.read_pos, sizeof(OuchCancelOrder));
                         
-                        uint64_t client_id = 0;
-                        for(int j=0; j<14; ++j) {
-                            if(req.order_token[j] >= '0' && req.order_token[j] <= '9') {
-                                client_id = client_id * 10 + (req.order_token[j] - '0');
-                            }
-                        }
+                        uint64_t order_token = decode_order_token(req.order_token);
 
-                        OrderSessionData data = session_manager.lookup_data(client_id);
+                        OrderSessionData data =
+                            (order_token < SessionManager::MAX_CLIENT_ORDERS)
+                                ? session_manager.lookup_data(order_token)
+                                : OrderSessionData{0, 0, 0};
                         uint64_t d2 = __rdtscp(&aux);
-                        
-                        if (data.internal_id != 0) [[likely]] {
+
+                        // Only the connection that owns the order may cancel it.
+                        // Identity comes from the session on both sides of this
+                        // comparison, so a client cannot cancel another's order by
+                        // guessing its token (review A6).
+                        if (data.internal_id != 0 && data.client_id == state.client_id) [[likely]] {
                             uint16_t shard = data.instrument_id % NUM_SHARDS;
                             EngineTask task;
                             task.type = MsgType::CANCEL;
                             task.cancel.internal_id = data.internal_id;
-                            task.cancel.client_order_id = client_id;
+                            task.cancel.client_order_id = order_token;
                             task.ingress_tsc = get_tsc();
                             while (!queues[shard][worker_id]->push(task)) { __builtin_ia32_pause(); }
                         }
@@ -356,6 +371,11 @@ public:
     }
 
 private:
+    // Server-assigned connection identity. Shared across workers because two
+    // SO_REUSEPORT workers can accept concurrently and ids must stay unique.
+    // Starts at 1: 0 means "no client" in the session map.
+    std::atomic<uint32_t> next_client_id{1};
+
     std::array<std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>, NUM_SHARDS>& queues;
     std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& gw_reject_queues;
     std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS>& pools;
