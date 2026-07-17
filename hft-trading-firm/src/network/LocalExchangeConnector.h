@@ -30,13 +30,6 @@ private:
     std::atomic<uint64_t> total_dequeue_cycles{0};
     std::atomic<uint64_t> total_orders_sent{0};
 
-    const char* INSTRUMENT_STRINGS[4] = {
-        "INSTR0  ",
-        "INSTR1  ",
-        "INSTR2  ",
-        "INSTR3  "
-    };
-
     ExecutionCallback exec_callback;
     std::thread tcp_rx_thread;
     std::thread network_tx_thread;
@@ -148,11 +141,10 @@ public:
                             req.side = action.is_buy ? 'B' : 'S';
                             req.shares = action.quantity;
                             
-                            if (action.instrument_id < 4) [[likely]] {
-                                std::memcpy(req.stock, INSTRUMENT_STRINGS[action.instrument_id], 8);
-                            } else {
-                                std::memcpy(req.stock, "UNKNOWN ", 8);
-                            }
+                            // Canonical STK##### encoding, from the protocol
+                            // header. The old INSTR0..3 literals decoded to no
+                            // instrument at all and were rejected 100% (A1).
+                            encode_symbol(req.stock, static_cast<uint16_t>(action.instrument_id));
                             
                             req.price = action.price;
                             req.time_in_force = 99998;
@@ -217,11 +209,10 @@ public:
                             req.side = action.is_buy ? 'B' : 'S';
                             req.shares = action.quantity;
                             
-                            if (action.instrument_id < 4) [[likely]] {
-                                std::memcpy(req.stock, INSTRUMENT_STRINGS[action.instrument_id], 8);
-                            } else {
-                                std::memcpy(req.stock, "UNKNOWN ", 8);
-                            }
+                            // Canonical STK##### encoding, from the protocol
+                            // header. The old INSTR0..3 literals decoded to no
+                            // instrument at all and were rejected 100% (A1).
+                            encode_symbol(req.stock, static_cast<uint16_t>(action.instrument_id));
                             
                             req.price = action.price;
                             req.time_in_force = 99998; // DAY

@@ -16,6 +16,7 @@
 
 // Each test file exposes one of these; main.cpp runs them all.
 void test_wire();
+void test_symbol();
 void test_queue();
 void test_orderbook();
 void test_framing();

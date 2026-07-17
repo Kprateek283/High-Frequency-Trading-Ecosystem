@@ -14,6 +14,56 @@ enum class Side : uint8_t { BUY, SELL };
 enum class MsgType : uint8_t { NEW, CANCEL };
 enum class ReportType : uint8_t { FILL, CANCEL, ADD, REJECT };
 
+// --- Canonical symbol encoding ---
+//
+// The wire carries symbols as "STK" followed by exactly 5 ASCII digits, in the
+// 8-byte OuchEnterOrder::stock field: STK00000 .. STK00255. There is one
+// encoder and one decoder and they live here, next to the structs they act on,
+// so a client and the gateway physically cannot disagree about what a symbol
+// means — the situation review A1 catalogued, where four clients used four
+// encodings and the documented benchmark matched zero orders.
+//
+// Instrument ids run [0, MAX_INSTRUMENTS). The cap is 256 because the price
+// ladder's bitmaps are per instrument per shard: raising it multiplies book
+// memory for no benchmark benefit, since a 256-symbol workload already
+// exercises every book path.
+inline constexpr uint16_t MAX_INSTRUMENTS = 256;
+
+// Returned by decode_symbol for anything that is not a valid in-range symbol.
+// It is deliberately >= MAX_INSTRUMENTS so the risk engine's range check
+// rejects it without needing a special case.
+inline constexpr uint16_t INVALID_INSTRUMENT = 0xFFFF;
+
+// Decodes an 8-byte wire symbol to an instrument id, or INVALID_INSTRUMENT.
+// Every rejection path is explicit: wrong prefix, a non-digit anywhere in the
+// numeric field, or an id at/above the cap.
+inline uint16_t decode_symbol(const char* stock) {
+    if (stock[0] != 'S' || stock[1] != 'T' || stock[2] != 'K') {
+        return INVALID_INSTRUMENT;
+    }
+    uint32_t id = 0;
+    for (int i = 3; i < 8; ++i) {
+        const char c = stock[i];
+        if (c < '0' || c > '9') return INVALID_INSTRUMENT;
+        id = id * 10 + static_cast<uint32_t>(c - '0');
+    }
+    if (id >= MAX_INSTRUMENTS) return INVALID_INSTRUMENT;
+    return static_cast<uint16_t>(id);
+}
+
+// Writes the canonical 8-byte wire symbol for `inst`. Every client uses this
+// rather than a hand-rolled literal; that is the whole point of the pair.
+inline void encode_symbol(char* stock, uint16_t inst) {
+    stock[0] = 'S';
+    stock[1] = 'T';
+    stock[2] = 'K';
+    stock[3] = static_cast<char>('0' + (inst / 10000) % 10);
+    stock[4] = static_cast<char>('0' + (inst / 1000) % 10);
+    stock[5] = static_cast<char>('0' + (inst / 100) % 10);
+    stock[6] = static_cast<char>('0' + (inst / 10) % 10);
+    stock[7] = static_cast<char>('0' + inst % 10);
+}
+
 #pragma pack(push, 1)
 
 // --- OUCH 4.2 Inbound Protocol ---

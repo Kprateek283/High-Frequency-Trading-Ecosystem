@@ -9,6 +9,7 @@ EngineStats g_stats;
 int main() {
     std::printf("engine_tests\n");
     RUN(test_wire);
+    RUN(test_symbol);
     RUN(test_queue);
     RUN(test_orderbook);
     RUN(test_framing);

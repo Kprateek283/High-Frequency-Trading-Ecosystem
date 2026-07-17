@@ -10,6 +10,10 @@
 #include <atomic>
 #include "protocol/messages.h"
 
+// The single instrument this market maker quotes. It used to send "AAPL    ",
+// which the gateway's decode never accepted, so every quote was rejected (A1).
+constexpr uint16_t MM_INSTRUMENT = 0;   // STK00000
+
 class MarketMaker {
 private:
     int tcp_fd;
@@ -70,7 +74,7 @@ public:
         
         req.side = (side == Side::BUY) ? 'B' : 'S';
         req.shares = qty;
-        std::memcpy(req.stock, "AAPL    ", 8); // Assuming inst 0 for market maker
+        encode_symbol(req.stock, MM_INSTRUMENT);
         req.price = price;
         req.time_in_force = 99998;
         std::memcpy(req.firm, "MM01", 4);
