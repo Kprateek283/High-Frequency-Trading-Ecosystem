@@ -13,6 +13,7 @@ int main() {
     RUN(test_queue);
     RUN(test_orderbook);
     RUN(test_framing);
+    RUN(test_identity);
     std::printf("all passed\n");
     return 0;
 }

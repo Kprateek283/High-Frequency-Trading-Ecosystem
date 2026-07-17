@@ -1,11 +1,5 @@
-#include "tests.h"
-#include "gateway/tcp_server.h"
-#include <sys/socket.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <cstring>
-#include <memory>
-#include <string>
+#include "gateway_fixture.h"
+#include <algorithm>
 
 // TCP framing and buffer compaction.
 //
@@ -14,108 +8,14 @@
 // and compacts the unparsed fragment to the front before each read. A previous
 // bug hard-reset that buffer instead, discarding partial messages and desyncing
 // the stream — these tests exist so that cannot come back silently.
-//
-// The gateway is driven over a socketpair rather than a real listener: no
-// accept, no port races, and the test controls exactly how the bytes are split.
 
-namespace {
-
-// A test port that no part of the system uses; the constructor still binds,
-// even though these tests never accept on the listener.
-constexpr int TEST_PORT = 19091;
-
-struct GatewayFixture {
-    std::array<std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>, NUM_SHARDS> queues;
-    std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>> reject_queues;
-    std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS> pools;
-    std::unique_ptr<TCPServer> server;
-    std::unordered_map<int, TCPServer::ClientState> states;
-    int client_fd = -1;   // test writes here
-    int server_fd = -1;   // gateway reads here
-
-    GatewayFixture() {
-        // One gateway worker; every test order targets instrument 0 -> shard 0,
-        // but all shards need a pool because the gateway indexes pools[shard].
-        for (int s = 0; s < NUM_SHARDS; ++s) {
-            pools[s] = std::make_unique<MemoryPool<Order>>(4096);
-            queues[s].push_back(std::make_unique<LockFreeQueue<EngineTask, 524288>>());
-        }
-        reject_queues.push_back(std::make_unique<LockFreeQueue<DropCopyMessage, 1048576>>());
-
-        server = std::make_unique<TCPServer>(TEST_PORT, 1, queues, reject_queues, pools);
-
-        int fds[2];
-        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-        client_fd = fds[0];
-        server_fd = fds[1];
-
-        // The gateway's read loop runs until EAGAIN, so its end must be
-        // non-blocking or handle_client would never return.
-        int flags = fcntl(server_fd, F_GETFL, 0);
-        fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
-
-        states[server_fd];
-    }
-
-    ~GatewayFixture() {
-        if (client_fd >= 0) close(client_fd);
-        // handle_client closes server_fd itself on a framing error; only close
-        // it here if it is still open.
-        if (server_fd >= 0 && fcntl(server_fd, F_GETFD) != -1) close(server_fd);
-        for (int fd : server->listen_fds) close(fd);
-        for (int fd : server->epoll_fds) close(fd);
-    }
-
-    void pump() { server->handle_client(server_fd, states, 0); }
-
-    void send_bytes(const void* p, size_t n) {
-        CHECK(write(client_fd, p, n) == (ssize_t)n);
-    }
-
-    // Drains shard 0's ingress queue and returns how many tasks landed.
-    int tasks_enqueued() {
-        int n = 0;
-        EngineTask t;
-        while (queues[0][0]->pop(t)) ++n;
-        return n;
-    }
-
-    int rejects_enqueued() {
-        int n = 0;
-        DropCopyMessage d;
-        while (reject_queues[0]->pop(d)) ++n;
-        return n;
-    }
-};
-
-// A valid order for instrument 0 (STK00000), which routes to shard 0.
-OuchEnterOrder make_order(uint64_t token_num, uint32_t price, uint32_t shares, char side) {
-    OuchEnterOrder o;
-    std::memset(&o, 0, sizeof(o));
-    o.msg_type = 'O';
-    std::string token = std::to_string(token_num);
-    token.insert(token.begin(), 14 - token.length(), '0');
-    std::memcpy(o.order_token, token.c_str(), 14);
-    o.side = side;
-    o.shares = shares;
-    std::memcpy(o.stock, "STK00000", 8);
-    o.price = price;
-    o.time_in_force = 99998;
-    std::memcpy(o.firm, "HFT1", 4);
-    o.display = 'Y';
-    o.capacity = 'P';
-    o.iso_eligibility = 'N';
-    o.cross_type = 'N';
-    o.customer_type = 'R';
-    return o;
-}
-
-} // namespace
+using namespace gwtest;
 
 void test_framing() {
     // --- One whole message in one write. The baseline. ---
     {
         GatewayFixture f;
+        f.connect(1);
         OuchEnterOrder o = make_order(1, 50000, 100, 'B');
         f.send_bytes(&o, sizeof(o));
         f.pump();
@@ -127,6 +27,7 @@ void test_framing() {
     // retaining the fragment; the second must complete it.
     {
         GatewayFixture f;
+        f.connect(1);
         OuchEnterOrder o = make_order(2, 50000, 100, 'B');
         const char* p = reinterpret_cast<const char*>(&o);
 
@@ -142,6 +43,7 @@ void test_framing() {
     // --- Byte-at-a-time delivery: the pathological split. ---
     {
         GatewayFixture f;
+        f.connect(1);
         OuchEnterOrder o = make_order(3, 50000, 100, 'B');
         const char* p = reinterpret_cast<const char*>(&o);
         for (size_t i = 0; i < sizeof(o); ++i) {
@@ -155,6 +57,7 @@ void test_framing() {
     // --- Two whole messages in one write. ---
     {
         GatewayFixture f;
+        f.connect(1);
         OuchEnterOrder a = make_order(4, 50000, 100, 'B');
         OuchEnterOrder b = make_order(5, 50001, 100, 'S');
         char buf[sizeof(a) * 2];
@@ -171,6 +74,7 @@ void test_framing() {
     // fragment must be memmove'd to the front and survive to the next read.
     {
         GatewayFixture f;
+        f.connect(1);
         OuchEnterOrder a = make_order(6, 50000, 100, 'B');
         OuchEnterOrder b = make_order(7, 50001, 100, 'S');
 
@@ -191,6 +95,7 @@ void test_framing() {
     // lands mid-chunk, so compaction runs on essentially every pass.
     {
         GatewayFixture f;
+        f.connect(1);
         constexpr int N = 20;
         char buf[sizeof(OuchEnterOrder) * N];
         for (int i = 0; i < N; ++i) {
@@ -213,17 +118,13 @@ void test_framing() {
     // --- A cancel is 19 bytes, not 81: mixed sizes must stay in frame. ---
     {
         GatewayFixture f;
+        f.connect(1);
         OuchEnterOrder o = make_order(8, 50000, 100, 'B');
         f.send_bytes(&o, sizeof(o));
         f.pump();
         CHECK(f.tasks_enqueued() == 1);
 
-        OuchCancelOrder c;
-        std::memset(&c, 0, sizeof(c));
-        c.msg_type = 'X';
-        std::memcpy(c.order_token, "00000000000008", 14);
-        c.shares = 100;
-
+        OuchCancelOrder c = make_cancel(8);
         OuchEnterOrder o2 = make_order(9, 50000, 100, 'B');
         char buf[sizeof(c) + sizeof(o2)];
         std::memcpy(buf, &c, sizeof(c));
@@ -240,12 +141,13 @@ void test_framing() {
     // every following byte is suspect.
     {
         GatewayFixture f;
+        f.connect(1);
         char junk = 'Z';
         f.send_bytes(&junk, 1);
         f.pump();
         CHECK(f.tasks_enqueued() == 0);
-        CHECK(f.states.find(f.server_fd) == f.states.end());  // connection dropped
-        f.server_fd = -1;  // handle_client closed it
+        CHECK(f.states.find(f.conns[0].server_fd) == f.states.end());  // dropped
+        f.conns[0].server_fd = -1;  // handle_client closed it
     }
 
     // --- A risk-rejected order must not desync the stream. ---
@@ -253,6 +155,7 @@ void test_framing() {
     // the order behind it must decode normally.
     {
         GatewayFixture f;
+        f.connect(1);
         OuchEnterOrder bad = make_order(10, 50000, 0, 'B');   // shares == 0 -> reject
         OuchEnterOrder good = make_order(11, 50000, 100, 'B');
         char buf[sizeof(bad) + sizeof(good)];

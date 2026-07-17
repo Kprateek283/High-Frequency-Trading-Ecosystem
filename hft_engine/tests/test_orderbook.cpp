@@ -38,8 +38,13 @@ struct BookFixture {
     }
 
     // Submits an order and returns its pool-slot handle (== its internal_id).
-    uint32_t submit(Side side, uint32_t price, uint32_t qty, uint64_t client_id) {
-        Order* o = pool->allocate(0, client_id, price, qty, uint16_t{0}, side);
+    // `token` is the client's order token; `owner` is the client identity, which
+    // defaults to distinct-per-token so these tests keep their existing
+    // "every order is a different client" behaviour.
+    uint32_t submit(Side side, uint32_t price, uint32_t qty, uint64_t token,
+                    uint32_t owner = 0) {
+        if (owner == 0) owner = static_cast<uint32_t>(token);
+        Order* o = pool->allocate(0, token, owner, price, qty, uint16_t{0}, side);
         uint32_t id = pool->index_of(o);
         o->internal_id = id;
         book->match_order(o);

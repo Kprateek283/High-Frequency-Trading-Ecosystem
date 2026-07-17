@@ -5,6 +5,7 @@ add_executable(engine_tests
     test_queue.cpp
     test_orderbook.cpp
     test_framing.cpp
+    test_identity.cpp
 )
 
 target_compile_options(engine_tests PRIVATE -Wall -Wextra -Werror -Wpedantic)

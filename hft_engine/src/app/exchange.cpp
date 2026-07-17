@@ -26,6 +26,13 @@ EngineStats g_stats;
 const int TOTAL_ORDERS_EXPECTED = 1000000;
 std::atomic<bool> g_running{true};
 
+// An order's internal_id is its pool slot index, and SessionManager packs that
+// id into a fixed-width field alongside the instrument and the owning client.
+// If the pool ever outgrows that field, ids would silently wrap into the
+// neighbouring bits and cancels would resolve to the wrong order.
+static_assert(POOL_CAPACITY_PER_SHARD <= SessionManager::MAX_INTERNAL_ID,
+              "pool capacity exceeds the session map's internal_id field");
+
 
 
 void signal_handler(int signal) {

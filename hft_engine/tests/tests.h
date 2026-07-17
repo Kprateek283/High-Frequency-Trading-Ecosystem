@@ -20,6 +20,7 @@ void test_symbol();
 void test_queue();
 void test_orderbook();
 void test_framing();
+void test_identity();
 
 #define CHECK(cond)                                                            \
     do {                                                                       \
