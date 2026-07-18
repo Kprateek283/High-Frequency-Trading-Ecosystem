@@ -171,4 +171,16 @@ void test_identity() {
         CHECK(g.instrument_id == 0);
         CHECK(g.client_id == 1);
     }
+
+    // --- Gateway core-map parse (Phase 3.2). ---
+    // core_for_worker picks the idx-th entry of the GATEWAY_CORES list and returns
+    // -1 for unset/empty/short lists so pin_gateway_worker leaves the worker alone.
+    {
+        CHECK(core_for_worker("1,3,5,7", 0) == 1);
+        CHECK(core_for_worker("1,3,5,7", 3) == 7);
+        CHECK(core_for_worker("1,3,5,7", 4) == -1);  // past the end
+        CHECK(core_for_worker("2", 1) == -1);        // fewer cores than workers
+        CHECK(core_for_worker("", 0) == -1);
+        CHECK(core_for_worker(nullptr, 0) == -1);
+    }
 }
