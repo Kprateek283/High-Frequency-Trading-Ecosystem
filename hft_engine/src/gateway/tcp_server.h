@@ -11,6 +11,10 @@
 #include <unordered_map>
 #include <sys/resource.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
+#include <sched.h>
+#include <cstdlib>
+#include <string>
 #include "core/lock_free_queue.h"
 #include "core/memory_pool.h"
 #include "matching/order.h"
@@ -19,6 +23,44 @@
 #include "gateway/session_manager.h"
 
 constexpr int NUM_SHARDS = 4;
+
+// Pin gateway worker `thread_id` to its core from the GATEWAY_CORES map (config.env,
+// e.g. "1,3,5,7") and raise it to SCHED_FIFO 99 — the same treatment the engine and
+// publisher threads already get in exchange.cpp. Without this the SO_REUSEPORT workers
+// float across cores at normal priority (known-issues [HIGH]). Best-effort: on a
+// desktop without CAP_SYS_NICE the priority/affinity calls fail and we warn, exactly
+// like set_realtime_priority does, rather than aborting the run.
+// Pure helper: the idx-th core in a "1,3,5,7" list, or -1 if the list is
+// null/empty or has fewer than idx+1 entries. Split out so it is unit-testable.
+inline int core_for_worker(const char* list, int idx) {
+    if (!list || !*list) return -1;
+    int i = 0;
+    for (const char* p = list; ; ++p) {
+        if (i == idx) return std::atoi(p);
+        while (*p && *p != ',') ++p;
+        if (!*p) return -1;         // fewer cores than idx+1
+        ++i;
+    }
+}
+
+inline void pin_gateway_worker(int thread_id) {
+    int core = core_for_worker(std::getenv("GATEWAY_CORES"), thread_id);
+    if (core < 0) return;           // unset/short → leave the worker where it is
+
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+        std::cerr << "Warning: gateway worker " << thread_id
+                  << " could not pin to core " << core << std::endl;
+    }
+    struct sched_param param;
+    param.sched_priority = 99;
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
+        std::cerr << "Warning: gateway worker " << thread_id
+                  << " could not set SCHED_FIFO." << std::endl;
+    }
+}
 
 class TCPServer {
 public:
@@ -132,6 +174,7 @@ public:
     }
 
     void worker_loop(int thread_id, std::atomic<bool>& running) {
+        pin_gateway_worker(thread_id);   // affinity + SCHED_FIFO, from GATEWAY_CORES
         int e_fd = epoll_fds[thread_id];
         int l_fd = listen_fds[thread_id];
 
