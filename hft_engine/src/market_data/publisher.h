@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <cstring>
+#include <cstdlib>
 #include <atomic>
 #include "core/lock_free_queue.h"
 #include "protocol/messages.h"
@@ -23,11 +24,26 @@ public:
         pthread_setname_np(pthread_self(), "MarketData");
         
         int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+        // Multicast group/port from config (defaults match the historical values).
+        const char* group = std::getenv("MULTICAST_GROUP");
+        const char* port = std::getenv("MULTICAST_PORT");
         struct sockaddr_in mcast_addr;
         std::memset(&mcast_addr, 0, sizeof(mcast_addr));
         mcast_addr.sin_family = AF_INET;
-        mcast_addr.sin_addr.s_addr = inet_addr("239.255.0.1");
-        mcast_addr.sin_port = htons(12345);
+        mcast_addr.sin_addr.s_addr = inet_addr(group ? group : "239.255.0.1");
+        mcast_addr.sin_port = htons(port ? static_cast<uint16_t>(std::atoi(port)) : 12345);
+
+        // One-time multicast hardening (prep §2): make the send interface, TTL and
+        // loopback explicit instead of relying on Linux defaults, so a monitor on
+        // another host/interface can subscribe reliably. Off the hot path.
+        int ttl = 1;
+        setsockopt(udp_fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+        int loop = 1;
+        setsockopt(udp_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
+        struct in_addr iface{};
+        iface.s_addr = htonl(INADDR_ANY);
+        setsockopt(udp_fd, IPPROTO_IP, IP_MULTICAST_IF, &iface, sizeof(iface));
 
         const size_t BATCH_SIZE = 64; 
         ItchMessage batch[BATCH_SIZE];
