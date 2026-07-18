@@ -14,6 +14,7 @@
 #include "matching/engine.h"   // TscTuple, used in the queue members below
 
 #include "core/timer.h"
+#include "core/stats_region.h"
 
 struct OrderLogEntry {
     uint64_t timestamp_tsc;
@@ -55,7 +56,13 @@ private:
     uint64_t trades = 0;
     uint64_t rejects = 0;
 
+    HftStatsRegion* stats = nullptr;   // optional; set before run()
+
 public:
+    // Wire in the shared-memory stats region. Optional: if never set, the engine
+    // runs exactly as before with no region writes.
+    void set_stats_region(HftStatsRegion* r) { stats = r; }
+
     OrderManager(std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS>& dcq,
                  std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& reject_qs,
                  std::array<std::unique_ptr<LockFreeQueue<TscTuple, 1048576>>, NUM_SHARDS>& tq,
@@ -115,7 +122,11 @@ public:
         
         while (running.load(std::memory_order_relaxed)) {
             bool found = false;
-            
+
+            // Liveness heartbeat (4.5): the monitor treats a stale value as a
+            // stalled drain. Cheap enough to write every iteration.
+            if (stats) stats->heartbeat_tsc.store(get_tsc(), std::memory_order_relaxed);
+
             // 1. Drain Drop Copy Queues (engine-produced: NEW / FILL / CANCEL)
             //    and the per-worker gateway reject queues (pre-trade REJECTED).
             //    Each queue has exactly one producer, preserving the SPSC contract.
@@ -133,6 +144,19 @@ public:
                 if (m.state == OrderState::NEW) new_orders++;
                 else if (m.state == OrderState::FILLED || m.state == OrderState::PARTIAL_FILL) trades++;
                 else if (m.state == OrderState::REJECTED) rejects++;
+
+                // Cumulative per-shard counters in the stats region (4.3). Monotonic
+                // relaxed fetch_adds by this single thread; the shard is derived from
+                // the message's instrument the same way the gateway routes it. Python
+                // reads these directly (they only rise); the sampled block below is
+                // what the seqlock protects.
+                if (stats) {
+                    ShardStats& S = stats->shards[m.instrument_id % NUM_SHARDS];
+                    if (m.state == OrderState::NEW) S.orders_in.fetch_add(1, std::memory_order_relaxed);
+                    else if (m.state == OrderState::FILLED || m.state == OrderState::PARTIAL_FILL) S.fills.fetch_add(1, std::memory_order_relaxed);
+                    else if (m.state == OrderState::CANCELED) S.cancels.fetch_add(1, std::memory_order_relaxed);
+                    else if (m.state == OrderState::REJECTED) S.rejects.fetch_add(1, std::memory_order_relaxed);
+                }
             };
 
             for (int i = 0; i < NUM_SHARDS; ++i) {

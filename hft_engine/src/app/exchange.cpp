@@ -14,8 +14,10 @@
 #include <vector>
 #include <netinet/tcp.h>
 #include <csignal>
+#include <cstdio>
 #include "matching/engine.h"
 #include "core/timer.h"
+#include "core/stats_region.h"
 #include "core/memory_pool.h"
 #include "core/lock_free_queue.h"
 #include "gateway/tcp_server.h"
@@ -101,9 +103,20 @@ int main() {
 
     Timer timer(TOTAL_ORDERS_EXPECTED);
 
+    // Shared-memory stats region (Phase 4). Optional: if it can't be mapped the
+    // engine runs unchanged, just without observability.
+    const char* shm_path = std::getenv("STATS_SHM_PATH");
+    HftStatsRegion* stats = map_stats_region(shm_path ? shm_path : "/dev/shm/hft_stats");
+    if (stats) {
+        init_stats_region(stats, NUM_SHARDS, timer.cycles_per_ns_value());
+    } else {
+        std::cerr << "Warning: could not map stats region; running without it." << std::endl;
+    }
+
     // 2. Instantiate Business Logic Components
     Publisher mkt_publisher(mkt_data_queues, g_running);
     OrderManager<NUM_SHARDS> order_manager(drop_copy_queues, gw_reject_queues, tsc_queues, timer, g_running);
+    order_manager.set_stats_region(stats);
     TCPServer server(9091, num_gw, engine_queues, gw_reject_queues, pools);
 
     // 3. Spawn Threads and Pin to Isolated Cores
@@ -136,8 +149,43 @@ int main() {
 
     std::cout << "Gateway listening on port 9091. Press Ctrl+C to shutdown." << std::endl;
 
-    // 4. Wait for shutdown signal
+    // Liveness metadata (4.5): PID file + a single READY line the orchestrator
+    // waits on. Sockets are bound (TCPServer ctor) and every thread is spawned and
+    // pinning itself; a short settle lets the workers reach their pin before READY.
+    const char* pid_path = std::getenv("PID_FILE");
+    if (FILE* pf = std::fopen(pid_path ? pid_path : "exchange.pid", "w")) {
+        std::fprintf(pf, "%d\n", getpid());
+        std::fclose(pf);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::cout << "READY" << std::endl;
+
+    // 4. Wait for shutdown; meanwhile sample the stats region every ~100ms. This
+    // is the single seqlock writer of the sampled block: queue depths, pool
+    // high-water, the gateway cycle attribution, and the dropped-* counters
+    // mirrored out of g_stats. The per-shard order counters and heartbeat are
+    // written by the OrderManager; the anchor was written once above.
     while (g_running.load()) {
+        if (stats) {
+            stats_write(stats, [&]() {
+                for (int i = 0; i < NUM_SHARDS; ++i) {
+                    uint64_t eng = 0;
+                    for (auto& q : engine_queues[i]) eng += q->size();
+                    stats->shards[i].engine_q_depth.store(eng, std::memory_order_relaxed);
+                    stats->shards[i].dropcopy_q_depth.store(drop_copy_queues[i]->size(), std::memory_order_relaxed);
+                    stats->shards[i].mktdata_q_depth.store(mkt_data_queues[i]->size(), std::memory_order_relaxed);
+                    stats->shards[i].pool_high_water.store(pools[i]->slots_used(), std::memory_order_relaxed);
+                }
+                stats->epoll_cycles.store(server.total_epoll_cycles.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                stats->read_cycles.store(server.total_read_cycles.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                stats->decode_cycles.store(server.total_decode_cycles.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                stats->validation_cycles.store(server.total_validation_cycles.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                stats->enqueue_cycles.store(server.total_enqueue_cycles.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                stats->orders_processed.store(server.total_orders_processed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                stats->dropped_reports.store(g_stats.dropped_reports.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                stats->dropped_drop_copies.store(g_stats.dropped_drop_copies.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            });
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
