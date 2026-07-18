@@ -74,25 +74,30 @@ Trading-Ecosystem/
 git clone https://github.com/Kprateek283/High-Frequency-Trading-Engine.git
 cd High-Frequency-Trading-Engine
 
-# Build the Ecosystem
+# Build the Ecosystem (binaries land in build/bin/)
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
+cd ..
 
-# Run Benchmark / Stress Test
+# Run Benchmark / Stress Test (must be run from the repo root)
 ./scripts/run_sharding.sh
 
-# View detailed benchmark results
-cat new_results.txt
+# View benchmark results
+cat results.txt
 ```
 
 ### Sample Benchmark Output
 ```text
-Throughput      : 10,000,000 msgs/sec
-End-to-End      : 1,422,379 cycles
-Trading Engine  : 350 cycles
 Gateway Threads : 4
+entries       : 30000
+NEW           : 10000
+matches       : 20000
+FILLED        : 20000
 ```
+> Throughput/latency numbers are pending re-measurement on reference hardware
+> (`TODO(measure)`); the run above verifies the pipeline end-to-end and that
+> matches are produced.
 
 ## 7. Future Work
 1. **Kernel Bypass:** Implement Intel DPDK or Solarflare `ef_vi` to map the NIC directly to userspace memory.
