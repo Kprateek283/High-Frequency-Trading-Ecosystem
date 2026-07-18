@@ -101,6 +101,11 @@ word-boundary and empty-book cases (this whole bitmap ladder currently has **no 
 
 ---
 
+> ✅ **RESOLVED** (Phase 3.2). The pinning/priority setup now runs **inside each worker's
+> loop entry**, with a per-worker core taken from the `config.env` core map. The
+> SO_REUSEPORT gateway shards no longer float at normal priority — this was the last open
+> item in this file. Original analysis retained below.
+
 ## [HIGH] Gateway worker threads are neither pinned nor real-time — contradicts the design claims
 
 `set_realtime_priority` is applied to the *outer* `server_thread` (`app/exchange.cpp:100-104`),

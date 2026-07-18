@@ -8,11 +8,18 @@ The project models both sides of a trading venue: a Trading Firm Simulator capab
 ## 2. Key Results
 | Metric | Result |
 | :--- | :--- |
-| **Sustained Throughput** | 10,000,000+ messages/sec |
-| **End-to-End Latency** | 1.42M CPU cycles (~355 µs) |
-| **Core Business Logic** | 350–370 CPU cycles (<100 ns) |
-| **Kernel Networking Overhead** | ~77% of ingestion latency |
+| **Functional run** | 4-thread gateway matches orders end-to-end: 10,000 orders → 20,000 fills, **0 rejects** (`results.txt`) |
 | **Gateway Architecture** | 4-thread `SO_REUSEPORT` sharding |
+| **Latency probes** | 5-point `__rdtscp` decomposition (4 on-wire + gateway ingress) |
+| **Sustained Throughput** | `TODO(measure)` — re-run on reference hardware |
+| **End-to-End Latency** | `TODO(measure)` |
+| **Gateway Ingest Path** | `TODO(measure)` — Decode + Validate + Enqueue (this is the ingest path, *not* the matching engine, which is measured separately) |
+
+> Throughput, latency, and cycle figures are pending re-measurement on an idle reference
+> box (Phase 3.5 stop condition). Earlier headline numbers were measured on an unoptimised
+> engine running a reject loop (see [`docs/review-findings.md`](./docs/review-findings.md)
+> A1/A2/B9) and were removed rather than carried forward. Cycles→time conversions use the
+> TSC frequency the engine calibrates at startup, not the spec-sheet turbo clock.
 
 ## 3. Architecture
 ```text
@@ -46,7 +53,7 @@ We treat documentation as a first-class citizen. Detailed technical deep-dives a
 *   [**Architecture (`docs/architecture.md`)**](./docs/architecture.md): The dual-sided nature of the ecosystem, Thread-Per-Shard gateway, and Order Book design.
 *   [**Benchmarks & Capacity (`docs/benchmarks.md`)**](./docs/benchmarks.md): Telemetry proving the 10M msgs/sec scaling and Gateway CPU cycle attribution.
 *   [**Technical Deep Dive (`docs/technical-deep-dive.md`)**](./docs/technical-deep-dive.md): Lock-Free SPSC Queues, false-sharing mitigation, Memory Pools, and atomic memory barriers.
-*   [**Engineering Bottlenecks (`docs/bottlenecks.md`)**](./docs/bottlenecks.md): Challenges faced, including overcoming the 75ms TCP queueing delay and the epoll spin-loop bug.
+*   [**Engineering Bottlenecks (`docs/bottlenecks.md`)**](./docs/bottlenecks.md): Challenges faced, including the TCP queueing-delay saturation, the EBADF epoll spin-loop, and the SIGBUS on the mmap'd audit log.
 *   [**Telemetry Pipeline (`docs/telemetry.md`)**](./docs/telemetry.md): Using x86 hardware intrinsics to bypass `clock_gettime` overhead.
 
 ## 5. Repository Structure
@@ -58,7 +65,14 @@ Trading-Ecosystem/
 │   ├── benchmarks.md
 │   ├── bottlenecks.md
 │   ├── technical-deep-dive.md
-│   └── telemetry.md
+│   ├── telemetry.md
+│   ├── known-issues.md               # audited bugs + resolutions
+│   ├── review-findings.md            # senior review (A/B/C/D/E items)
+│   ├── implementation-plan.md        # phased build order
+│   ├── dependency.md                 # Python monitoring layout + interface contracts
+│   ├── cpp-prep-for-python-monitoring.md
+│   └── agent-handoff.md
+├── monitoring/             # Python monitoring layer (schema/readers/TUI/orchestrator)
 ├── hft_engine/             # Core Exchange (Gateway, BookBuilder, Risk)
 │   ├── src/
 │   └── CMakeLists.txt
@@ -101,5 +115,9 @@ FILLED        : 20000
 
 ## 7. Future Work
 1. **Kernel Bypass:** Implement Intel DPDK or Solarflare `ef_vi` to map the NIC directly to userspace memory.
-2. **NUMA Thread Affinity:** Use `pthread_setaffinity_np` to explicitly pin Gateway and Matching threads to specific physical CPU cores.
-3. **Protocol Optimization:** Transition from TCP to a custom Reliable UDP or Multicast architecture for market data dissemination.
+2. **Benchmark Re-measurement:** Run the full throughput/latency capacity matrix on an idle reference box and populate the `TODO(measure)` figures (Phase 3.5).
+3. **Protocol Optimization:** Transition from TCP to a custom Reliable UDP for order entry.
+
+> Thread affinity (`pthread_setaffinity_np` + `SCHED_FIFO`) is **already implemented** for
+> the engine, publisher, gateway, and — since Phase 3.2 — the gateway worker threads; it is
+> no longer future work. Market data already disseminates over ITCH multicast.

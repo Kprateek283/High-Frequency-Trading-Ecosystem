@@ -6,57 +6,83 @@ Building a system capable of processing 10,000,000 messages per second exposes f
 
 | Bottleneck | Root Cause | Resolution |
 |------------|------------|------------|
-| **75ms Latency Spike** | TCP receive-buffer saturation | `SO_REUSEPORT` sharding |
+| **Multi-ms Latency Spike** | TCP receive-buffer saturation | `SO_REUSEPORT` sharding |
 | **EBADF Spin Loop** | Invalid FD mapping | Correct FD ownership |
+| **SIGBUS Crash** | Write past mmap'd audit log | Bound writes by `write_index` |
 | **Oversubscription** | Too many active threads | 4-thread operating point |
+
+> The cycle/millisecond figures in the war stories below are the **historical
+> observations from the original debugging episodes** (pre-fix, unoptimised engine,
+> 1-thread reject loop). They are not rows of the current capacity matrix — that matrix is
+> `TODO(measure)` (see [`benchmarks.md`](./benchmarks.md)). Exact re-measured figures are
+> pending; the diagnoses stand on their own.
 
 ---
 
-## 1. The 75-Millisecond Phantom Latency
+## 1. The Multi-Millisecond Phantom Latency
 
 ### The Problem
-During initial capacity testing, the system successfully processed 1,000,000 msgs/sec with sub-millisecond latency. However, when pushed to 5,000,000 msgs/sec on a single thread, the end-to-end latency inexplicably skyrocketed to ~75 milliseconds. 
+During initial capacity testing, the system processed 1,000,000 msgs/sec with sub-millisecond latency. When pushed to a single-thread saturation load, end-to-end latency inexplicably jumped by *orders of magnitude* — from microseconds into the tens of milliseconds.
 
 ### The Investigation
 The initial hypothesis was that the C++ Order Book logic (vector insertions, sorting) was scaling non-linearly and choking under load. Standard profiling tools like `gprof` and `std::chrono` lacked the granularity to prove this without introducing heavy observer overhead.
 
-We built a custom hardware telemetry pipeline using the x86 `__rdtscp` intrinsic to timestamp packets at four distinct lifecycle boundaries. 
+We used the hardware telemetry pipeline (the five-point `__rdtscp` decomposition — see [`telemetry.md`](./telemetry.md)) to attribute the latency to a specific stage.
 
 ### The Discovery
-The telemetry data definitively disproved the initial hypothesis:
-*   **Trading Engine Execution:** ~5,000 CPU cycles.
-*   **TCP Network Path:** 299,000,000 CPU cycles (~75 milliseconds).
+The telemetry disproved the hypothesis by attribution, not magnitude: **engine execution stayed flat** (a few thousand cycles regardless of load), while the entire blow-up landed in the **TCP path** (`t5 - t4_network_deq`). The C++ business logic was executing in microseconds; the Linux kernel's TCP receive buffer was saturated. The single-threaded `epoll_wait` loop could not pull bytes into userspace fast enough, so packets queued inside the OS network stack. The spike was not execution time; it was **Queueing Delay**.
 
-The C++ business logic was flawlessly executing in microseconds, but the Linux Kernel's TCP receive buffer was completely saturated. The single-threaded `epoll_wait` loop could not pull bytes into userspace fast enough, causing packets to queue inside the OS network stack. The 75ms was not execution time; it was **Queueing Delay**.
+> Exact cycle figures are `TODO(measure)` — the original run recorded a ~300M-cycle TCP
+> path against a few-thousand-cycle engine, but on an unoptimised pre-fix engine; the
+> point (attribution to the kernel path, engine flat across load) is what the re-measured
+> matrix must confirm.
 
 ### The Resolution
 We refactored the Exchange Gateway to use `SO_REUSEPORT`, allowing multiple independent threads to bind to the same listening port. The kernel natively load-balanced the incoming TCP streams via hashing, splitting the ingress pressure across 4 parallel `epoll` loops. This reduced the queueing delay by several orders of magnitude and restored microsecond-scale latency.
 
 ---
 
-## 2. The `EBADF` `epoll` Spin-Loop Crash
+## 2. The `EBADF` `epoll` Spin-Loop
+
+*(This and the `SIGBUS` in §3 were originally written up as one causal chain. They are two
+independent bugs: `EBADF` is a return code and cannot itself raise `SIGBUS`. Splitting them
+is the honest account.)*
 
 ### The Problem
-Immediately after deploying the `SO_REUSEPORT` sharding fix, the system exhibited catastrophic failure. When blasted with traffic, the Exchange Gateway threads would suddenly peg the CPU at 100% utilization, freeze all processing, and eventually crash with a `SIGBUS` (Bus Error) memory violation.
+After deploying the `SO_REUSEPORT` sharding, the Exchange Gateway threads would suddenly peg the CPU at 100% utilization and freeze all processing.
 
 ### The Investigation
-Because the crash happened in a tight event loop under massive load, standard asynchronous loggers failed to flush the error state before the `SIGBUS` killed the process. We had to rely on synchronous `cerr` dumps and `strace` to inspect the syscalls immediately preceding the crash.
+`strace` revealed a massive, continuous wall of `epoll_wait` and `read` syscalls returning instantly.
 
 ### The Discovery
-The `strace` output revealed a massive, continuous wall of `epoll_wait` and `read` syscalls returning instantly. 
-
-During the sharding refactor, an array indexing bug caused the system to pass an invalid, mathematically offset File Descriptor (`local_fd`) to the `read()` syscall. 
-1.  `read(invalid_fd)` returned `-1` with an `errno` of `EBADF` (Bad File Descriptor).
-2.  Because the `read()` failed, the actual bytes on the *valid* socket were never drained from the kernel buffer.
-3.  Because the `epoll` loop was operating in **Edge-Triggered (`EPOLLET`) mode**, and the socket still had unread data, `epoll_wait` immediately woke up the thread again on the very next nanosecond.
-4.  This created an inescapable infinite loop of failed reads that drove CPU utilization to 100%, stalled useful work, and ultimately destabilized the process, culminating in a `SIGBUS` crash.
+During the sharding refactor, an array-indexing bug passed an invalid, mathematically offset File Descriptor to `read()`.
+1.  `read(invalid_fd)` returned `-1` with `errno == EBADF`.
+2.  The bytes on the *valid* socket were therefore never drained from the kernel buffer.
+3.  Under **Edge-Triggered (`EPOLLET`)** mode, the socket still holding unread data meant `epoll_wait` re-woke the thread immediately.
+4.  The result is an inescapable tight loop of failed reads pinning the core at 100% — a **livelock**, not a crash. It burns CPU forever; it does not, by itself, produce a signal.
 
 ### The Resolution
-We corrected the localized mapping between the `epoll_event.data.fd` and our internal session arrays, ensuring the exact kernel File Descriptor was passed to `read()`. Furthermore, we added explicit `errno == EBADF` fatal-exit guards to prevent silent spin-looping in the future.
+We corrected the mapping between `epoll_event.data.fd` and our internal session state, ensuring the exact kernel fd reaches `read()`, and added an explicit `errno == EBADF` guard against silent spin-looping.
 
 ---
 
-## 3. The Thread Oversubscription Barrier
+## 3. The `SIGBUS` on the Memory-Mapped Audit Log
+
+### The Problem
+Under sustained load the process would die with a `SIGBUS` (bus error) — a genuine memory fault, distinct from the spin-loop above.
+
+### The Investigation
+`SIGBUS` on Linux means an invalid physical access: an unaligned load/store, or a touch **past the end of an `mmap`'d region**. That pointed squarely at the one large mapping on the write path — `order_audit.log`.
+
+### The Discovery
+The `OrderManager` `mmap`s the audit log and appends fixed-size entries (`auxiliary/order_manager.h`). Writing an entry once the cursor ran past the mapped length dereferences memory beyond the mapping → `SIGBUS`.
+
+### The Resolution
+The audit log now carries a 64-byte header with an atomic `write_index`; appends are bounded by the mapped capacity and the committed count is published via `write_index` (the same field readers use to tail the log). Writes can no longer run off the end of the mapping. *(Tracked as the `[MED]` audit-log item in [`known-issues.md`](./known-issues.md), resolved.)*
+
+---
+
+## 4. The Thread Oversubscription Barrier
 
 ### The Problem
 Having successfully achieved 10M msgs/sec with 4 Gateway threads, we attempted to scale the system further by enabling 8 Gateway threads. Paradoxically, adding more threads *increased* the end-to-end latency and degraded the stability of the Trading Engine.
@@ -70,4 +96,4 @@ The underlying hardware was an Intel Core i5-1240P. This processor provides fewe
 This physically oversubscribed the CPU. The Linux OS scheduler was forced to preempt and migrate threads more frequently, increasing scheduling overhead and reducing cache locality.
 
 ### The Resolution
-We established that for this machine, a 4-shard configuration sustained 10,000,000 msgs/sec with lower latency than the 8-shard configuration, establishing it as the optimal operating point. To scale further without degradation, the system would require a dedicated high-core-count server processor (e.g., AMD EPYC or Intel Xeon) and explicit Thread Affinity (`pthread_setaffinity_np`) to permanently pin Gateway and Engine threads to isolated NUMA cores.
+A 4-shard configuration is the established operating point for this machine (whether it beats 8 shards on the re-measured matrix is `TODO(measure)`). Thread affinity is **already implemented**, not future work: engines, publisher, gateway, and OrderManager are pinned via `pthread_setaffinity_np` + `SCHED_FIFO` (`app/exchange.cpp`), and Phase 3.2 extended pinning to the spawned gateway *worker* threads that previously floated (the last open item in [`known-issues.md`](./known-issues.md)). Scaling further would require a dedicated high-core-count server processor (AMD EPYC / Intel Xeon) with enough isolated cores to avoid oversubscription in the first place.
