@@ -167,6 +167,8 @@ int main() {
     server.print_experiment_4_stats();
     std::cout << "\nMarket-data reports dropped (ITCH queue full): "
               << g_stats.dropped_reports.load(std::memory_order_relaxed) << std::endl;
+    std::cout << "Drop-copies dropped (drop-copy queue full): "
+              << g_stats.dropped_drop_copies.load(std::memory_order_relaxed) << std::endl;
     std::cout << "Engine Halted." << std::endl;
 
     return 0;

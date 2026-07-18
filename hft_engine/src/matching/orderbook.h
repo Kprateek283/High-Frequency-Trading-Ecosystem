@@ -149,8 +149,12 @@ private:
 
     inline void send_drop_copy(uint64_t client_id, uint64_t internal_id, uint64_t price, uint32_t qty, uint16_t inst, Side side, OrderState state) {
         DropCopyMessage msg = {client_id, internal_id, price, qty, inst, state, side};
-        // Don't spin, drop copy queue is huge and read asynchronously.
-        drop_copy_queue->push(msg);
+        // Don't spin, drop copy queue is huge and read asynchronously. If it does
+        // fill, count the loss (mirrors broadcast's dropped_reports) so the audit
+        // gap is visible instead of silent.
+        if (!drop_copy_queue->push(msg)) {
+            g_stats.dropped_drop_copies.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
 public:

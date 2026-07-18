@@ -219,4 +219,16 @@ void test_orderbook() {
         f.submit(Side::BUY, 102, 1, 5);       // book side is empty now
         CHECK(f.count_execs() == 0);
     }
+
+    // --- Drop-copy loss is counted, not silent (Phase 2.2). ---
+    // Fill the drop-copy queue to capacity, then submit: the order's NEW
+    // drop-copy can't be pushed, and the dropped_drop_copies counter must move.
+    {
+        BookFixture f;
+        uint64_t before = g_stats.dropped_drop_copies.load();
+        DropCopyMessage full{};
+        while (f.dc_q->push(full)) {}         // saturate the queue
+        f.submit(Side::BUY, 50000, 100, 1);   // NEW drop-copy is dropped
+        CHECK(g_stats.dropped_drop_copies.load() > before);
+    }
 }
