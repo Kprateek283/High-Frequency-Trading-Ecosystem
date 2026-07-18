@@ -231,4 +231,25 @@ void test_orderbook() {
         f.submit(Side::BUY, 50000, 100, 1);   // NEW drop-copy is dropped
         CHECK(g_stats.dropped_drop_copies.load() > before);
     }
+
+    // --- Self-trade prevention: cancel-newest (Phase 2.3). ---
+    {
+        BookFixture f;
+        f.submit(Side::SELL, 600, 100, 1, /*owner=*/7);   // client 7 rests an ask
+        f.drain();
+
+        // Same client crosses itself: rejected, no execution.
+        f.submit(Side::BUY, 600, 100, 2, /*owner=*/7);
+        CHECK(f.count_execs() == 0);
+        bool rejected = false;
+        DropCopyMessage d;
+        while (f.dc_q->pop(d)) {
+            if (d.state == OrderState::REJECTED) rejected = true;
+        }
+        CHECK(rejected);
+
+        // The resting ask is untouched: a different client fills it.
+        f.submit(Side::BUY, 600, 100, 3, /*owner=*/8);
+        CHECK(f.count_execs() == 2);
+    }
 }

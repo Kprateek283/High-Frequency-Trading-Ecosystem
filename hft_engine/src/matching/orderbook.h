@@ -157,6 +157,16 @@ private:
         }
     }
 
+    // Self-trade prevention (cancel-newest): the incoming order would execute
+    // against a resting order from the same client, so reject the incoming
+    // order's remainder instead of crossing. No book surgery — the resting
+    // side is untouched.
+    inline void reject_self_trade(Order* o) {
+        send_drop_copy(o->client_order_id, o->internal_id, o->price, o->quantity,
+                       o->instrument_id, o->side, OrderState::REJECTED);
+        pool->deallocate(o);
+    }
+
 public:
     OrderBook() {
         std::memset(static_cast<void*>(bids), 0, sizeof(bids));
@@ -223,16 +233,20 @@ public:
                 Limit& level = asks[p];
                 while (new_order->quantity > 0 && level.head) {
                     Order* resting = level.head;
+                    if (resting->client_id == new_order->client_id) [[unlikely]] {
+                        reject_self_trade(new_order);
+                        return;
+                    }
                     if (resting->next) [[likely]] {
                         __builtin_prefetch(resting->next, 0, 3);
                     }
                     uint32_t match_qty = std::min(new_order->quantity, resting->quantity);
                     broadcast('E', resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side == Side::BUY ? 'B' : 'S');
                     broadcast('E', new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side == Side::BUY ? 'B' : 'S');
-                    
-                    send_drop_copy(new_order->client_order_id, new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side, 
+
+                    send_drop_copy(new_order->client_order_id, new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side,
                                    new_order->quantity > resting->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
-                    send_drop_copy(resting->client_order_id, resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side, 
+                    send_drop_copy(resting->client_order_id, resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side,
                                    resting->quantity > new_order->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
 
                     if (new_order->quantity >= resting->quantity) [[likely]] {
@@ -273,16 +287,20 @@ public:
                 Limit& level = bids[p];
                 while (new_order->quantity > 0 && level.head) {
                     Order* resting = level.head;
+                    if (resting->client_id == new_order->client_id) [[unlikely]] {
+                        reject_self_trade(new_order);
+                        return;
+                    }
                     if (resting->next) [[likely]] {
                         __builtin_prefetch(resting->next, 0, 3);
                     }
                     uint32_t match_qty = std::min(new_order->quantity, resting->quantity);
                     broadcast('E', resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side == Side::BUY ? 'B' : 'S');
                     broadcast('E', new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side == Side::BUY ? 'B' : 'S');
-                    
-                    send_drop_copy(new_order->client_order_id, new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side, 
+
+                    send_drop_copy(new_order->client_order_id, new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side,
                                    new_order->quantity > resting->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
-                    send_drop_copy(resting->client_order_id, resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side, 
+                    send_drop_copy(resting->client_order_id, resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side,
                                    resting->quantity > new_order->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
 
                     if (new_order->quantity >= resting->quantity) [[likely]] {
