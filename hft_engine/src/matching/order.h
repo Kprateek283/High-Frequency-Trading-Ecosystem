@@ -67,6 +67,7 @@ struct alignas(32) DropCopyMessage {
 // Global statistics for monitoring health without slowing down the engine
 struct EngineStats {
     std::atomic<uint64_t> dropped_reports{0};
+    std::atomic<uint64_t> dropped_drop_copies{0};
 };
 
 extern EngineStats g_stats;
