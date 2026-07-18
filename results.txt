@@ -1,0 +1,10 @@
+# HFT ecosystem run  2026-07-18T12:13:16Z
+Gateway Threads : 4
+entries       : 30000
+NEW           : 10000
+matches       : 20000
+FILLED        : 20000
+PARTIAL_FILL  : 0
+CANCELED      : 0
+REJECTED      : 0
+# TODO(measure): throughput/latency matrix not re-measured on this box (plan 3.5).
