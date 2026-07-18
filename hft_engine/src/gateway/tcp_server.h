@@ -306,6 +306,16 @@ public:
 
                         uint16_t shard = inst % NUM_SHARDS;
                         Order* o = pools[shard]->allocate(0, order_token, client_id, req.price, req.shares, inst, side);
+                        if (!o) [[unlikely]] {
+                            // Pool exhausted: too many live orders in this shard. The
+                            // order never enters the book; reject it like a risk reject
+                            // and keep serving instead of tearing down the process.
+                            DropCopyMessage drop_msg = {order_token, 0, req.price, req.shares, inst, OrderState::REJECTED, side};
+                            gw_reject_queues[worker_id]->push(drop_msg);
+                            state.read_pos += sizeof(OuchEnterOrder);
+                            total_orders_processed.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
                         uint32_t internal_id = pools[shard]->index_of(o); // pool slot IS the handle
                         o->internal_id = internal_id;
                         session_manager.record_order(order_token, internal_id, inst, client_id);
