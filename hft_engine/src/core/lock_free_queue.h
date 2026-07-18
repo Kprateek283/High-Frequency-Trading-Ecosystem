@@ -41,6 +41,15 @@ public:
         return head.load(std::memory_order_relaxed) == tail.load(std::memory_order_relaxed);
     }
 
+    // Current occupancy, for the stats region (Phase 4.2). Relaxed loads: a
+    // monitor reads a slightly stale depth, never a torn one. Ring is power-of-two
+    // so the masked difference is the live count regardless of wrap.
+    size_t size() const {
+        const size_t t = tail.load(std::memory_order_relaxed);
+        const size_t h = head.load(std::memory_order_relaxed);
+        return (t - h) & (Capacity - 1);
+    }
+
 private:
     alignas(128) std::array<T, Capacity> buffer;
     

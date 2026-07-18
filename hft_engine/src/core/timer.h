@@ -65,6 +65,9 @@ public:
         std::cerr << "Max:              " << to_ns(sorted_latencies.back()) << " ns (" << sorted_latencies.back() << " cycles)" << std::endl;
     }
 
+    // Calibrated TSC frequency, for the stats-region anchor (Phase 4.4).
+    double cycles_per_ns_value() const { return cycles_per_ns; }
+
 private:
     std::vector<uint64_t> latencies;
     std::atomic<size_t> count;
