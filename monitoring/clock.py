@@ -24,6 +24,11 @@ class Clock:
         """Cycle delta (now_tsc - tsc) rendered as nanoseconds — for heartbeat age."""
         return (now_tsc - tsc) / self.cycles_per_ns
 
+    def now_tsc_estimate(self, unix_ns):
+        """Inverse of to_epoch_ns: estimate the current TSC from a wall-clock ns.
+        Lets a Python reader (no rdtsc) feed a `now_tsc` to age_ns/health.assess."""
+        return self.tsc_at_anchor + (unix_ns - self.unix_ns_at_anchor) * self.cycles_per_ns
+
     @classmethod
     def from_region(cls, buf):
         tsc_a, unix_a, cpn = struct.unpack_from(wire.ANCHOR_FMT, buf, wire.OFF_ANCHOR)
@@ -37,6 +42,9 @@ def _selftest():
     assert c.to_epoch_ns(3000) == 1_001_000            # +2000 cycles = +1000 ns
     assert c.to_epoch_ns(0) == 1_000_000 - 500         # before the anchor
     assert c.age_ns(1000, 3000) == 1000.0
+    # now_tsc_estimate inverts to_epoch_ns
+    assert c.now_tsc_estimate(1_001_000) == 3000        # +1000 ns → +2000 cycles
+    assert c.to_epoch_ns(c.now_tsc_estimate(1_234_567)) == 1_234_567
     # from_region round-trips through the real anchor offset
     buf = bytearray(wire.STATS_REGION_SIZE)
     struct.pack_into(wire.ANCHOR_FMT, buf, wire.OFF_ANCHOR, 1000, 1_000_000, 2.0)
