@@ -119,6 +119,9 @@ public:
 
             int e_fd = epoll_create1(0);
             struct epoll_event ev;
+            // Listener is intentionally LEVEL-triggered (no EPOLLET): one accept()
+            // per wakeup is correct and simpler than the ET accept()-drain loop.
+            // Client fds below are edge-triggered (EPOLLIN | EPOLLET).
             ev.events = EPOLLIN;
             ev.data.fd = l_fd;
             epoll_ctl(e_fd, EPOLL_CTL_ADD, l_fd, &ev);
