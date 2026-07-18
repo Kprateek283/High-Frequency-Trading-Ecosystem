@@ -14,6 +14,7 @@ int main() {
     RUN(test_orderbook);
     RUN(test_framing);
     RUN(test_identity);
+    RUN(test_pool);
     std::printf("all passed\n");
     return 0;
 }

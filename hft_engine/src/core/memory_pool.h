@@ -1,6 +1,5 @@
 #pragma once
 #include <cstdint>
-#include <stdexcept>
 #include <new>
 #include <cstdlib>
 #include <cstring>
@@ -80,12 +79,16 @@ public:
         if (recycle_queue.pop(index)) {
             // Reused!
         } else {
-            uint32_t next = high_water_mark++;
+            uint32_t next = high_water_mark;
             if (next < pool_capacity) [[likely]] {
+                high_water_mark = next + 1;
                 index = next;
             } else {
+                // Exhaustion is a client behaviour (too many live orders), not a
+                // process fault. Return null so the gateway can reject the order
+                // exactly like a risk reject instead of tearing the engine down.
                 alloc_lock.clear(std::memory_order_release);
-                throw std::runtime_error("Memory Pool exhausted!");
+                return nullptr;
             }
         }
         alloc_lock.clear(std::memory_order_release);

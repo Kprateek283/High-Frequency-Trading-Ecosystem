@@ -21,6 +21,7 @@ void test_queue();
 void test_orderbook();
 void test_framing();
 void test_identity();
+void test_pool();
 
 #define CHECK(cond)                                                            \
     do {                                                                       \
