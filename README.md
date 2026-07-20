@@ -87,6 +87,7 @@ Trading-Ecosystem/
 │   ├── technical-deep-dive.md
 │   ├── telemetry.md
 │   ├── known-issues.md               # audited bugs + resolutions
+│   ├── v1.0.0-defects.md             # OPEN defects in v1.0.0 + fix plan
 │   ├── review-findings.md            # senior review (A/B/C/D/E items)
 │   ├── implementation-plan.md        # phased build order
 │   ├── dependency.md                 # Python monitoring layout + interface contracts
