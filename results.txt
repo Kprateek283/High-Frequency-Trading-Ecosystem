@@ -1,4 +1,4 @@
-# HFT ecosystem run  2026-07-18T12:13:16Z
+# HFT ecosystem run  2026-07-20T19:21:35Z
 Gateway Threads : 4
 entries       : 30000
 NEW           : 10000
@@ -7,4 +7,7 @@ FILLED        : 20000
 PARTIAL_FILL  : 0
 CANCELED      : 0
 REJECTED      : 0
-# TODO(measure): throughput/latency matrix not re-measured on this box (plan 3.5).
+# Gateway ingest throughput: see benchmark_results.txt
+#   (regenerate with scripts/measure_throughput.py).
+# TODO(measure): end-to-end latency percentiles still need a box that can
+#   grant SCHED_FIFO; see docs/benchmarks.md.
