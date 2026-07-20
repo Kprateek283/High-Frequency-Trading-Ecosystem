@@ -103,23 +103,35 @@ monitoring/                  does not exist → Phase 5 creates it (layout per d
 - **The audit-log header layout** in prep-doc §5 is frozen — readers depend on the
   magic/version/entry_size/write_index offsets exactly as written there.
 
-## Build & run (verified today, pre-Phase-0)
+## Build & run (verified at v1.0.0)
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release      # from repo root; builds both projects
 cmake --build build -j
+(cd build && ctest)                            # C++ suite
 
-GATEWAY_THREADS=4 ./build/hft_engine/exchange  # terminal 1 (writes order_audit.log to cwd)
-./build/hft_engine/tester                      # terminal 2 — env: TARGET_RATE (msgs/s), WORKLOAD_TYPE (1-4)
-# or the documented (currently broken until Phase 1/3) path:
-./scripts/run_sharding.sh                      # must run from repo root
+python3 -m monitoring.run_tests                # Python suite; runs with nothing installed
+
+# The TUI needs `rich`. Debian/Ubuntu refuse system-wide pip installs (PEP 668),
+# so use a venv rather than `pip install -r` against the system interpreter.
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+./scripts/run_sharding.sh                      # the documented benchmark; run from repo root
+
+GATEWAY_THREADS=4 ./build/bin/exchange         # terminal 1 (writes order_audit.log to cwd)
+./build/bin/tester                             # terminal 2 — env: TARGET_RATE (msgs/s), WORKLOAD_TYPE (1-4)
+.venv/bin/python -m monitoring.tui.app         # terminal 3 — live dashboard
 ```
 
-Cautions: binaries move to `build/bin/` in Phase 0.1 — update paths everywhere in the
-same commit. `SCHED_FIFO`/`mlockall`/huge pages may need privileges; the engine falls
-back with stderr warnings — read stderr on first run. Engine threads busy-spin at
-`SCHED_FIFO` 99 pinned to cores 2/4/6/8/10/12/14: on a desktop without
-`scripts/setup_isolcpus.sh` applied, expect the machine to be sluggish under load.
+Cautions: `SCHED_FIFO`/`mlockall`/huge pages need privileges the engine often does not
+have; it falls back with stderr warnings, so read stderr on the first run. Engine threads
+busy-spin at `SCHED_FIFO` 99 pinned to the cores in `config.env`: on a desktop without
+`scripts/setup_isolcpus.sh` applied, expect the machine to be sluggish under load, and
+expect latency measurements from such a box to be meaningless.
+
+The tester is a single client, and self-trade prevention rejects same-client crosses, so
+`tester` alone produces **no fills** by design. Use `./build/bin/liquidity` (two
+connections, deterministic 10,000 matches) when you need fills to look at.
 
 ## Working rules
 
@@ -143,17 +155,23 @@ back with stderr warnings — read stderr on first run. Engine threads busy-spin
 - Anything blocked on an unwritten spec (I7 control socket, gap-detection sequence) is
   out of scope — flag it, don't invent it.
 
-## Definition of done
+## Definition of done — **all gates met at v1.0.0**
 
-Every phase gate from the plan, checked off in order:
+The plan is complete and tagged. Kept as a record of what each gate required.
 
-- [ ] **P0** both projects build clean under `-Werror` from one protocol header; `ctest` passes; binaries in `build/bin/`
-- [ ] **P1** decode unit tests green; firm traffic produces **fills**; exact audit-log event count
-- [ ] **P2** exhaustion stress survives (no terminate); drop-copy counter surfaces; STP test green
-- [ ] **P3** fresh clone + README verbatim → results file with matches > 0 on a 4-thread gateway *(3.5 measurement optional per stop conditions)*
-- [ ] **P4** external reader sees rising counters, fresh heartbeat, sane TSC anchor; multicast received on an explicitly-joined socket
-- [ ] **P5** TUI shows live shard stats, trade tape, top-of-book against a running engine; Python tests green
-- [ ] **P6** no doc quotes a number absent from the results file; no doc shows an API that doesn't compile; all docs agree on the timestamp count
+- [x] **P0** both projects build clean under `-Werror` from one protocol header; `ctest` passes; binaries in `build/bin/`
+- [x] **P1** decode unit tests green; firm traffic produces **fills**; exact audit-log event count
+- [x] **P2** exhaustion stress survives (no terminate); drop-copy counter surfaces; STP test green
+- [x] **P3** fresh clone + README verbatim → results file with matches > 0 on a 4-thread gateway
+- [x] **P4** external reader sees rising counters, fresh heartbeat, sane TSC anchor; multicast received on an explicitly-joined socket
+- [x] **P5** TUI shows live shard stats, trade tape, top-of-book against a running engine; Python tests green
+- [x] **P6** no doc quotes a number absent from the results file; no doc shows an API that doesn't compile; all docs agree on the timestamp count
 
-Final deliverable: a report listing each plan item as done/skipped(with reason), each
-gate's actual observed output, and any code-vs-doc discrepancies found along the way.
+One gate was met only in part, deliberately. **P3's re-measurement** covers gateway ingest
+throughput (`benchmark_results.txt`, reproducible via `scripts/measure_throughput.py`) but
+**not** end-to-end latency percentiles: this box cannot grant `SCHED_FIFO`, and tail latency
+measured under arbitrary preemption describes the scheduler rather than the engine. That
+remains `TODO(measure)` pending different hardware.
+
+**Current status lives in [`v1.0.0-defects.md`](./v1.0.0-defects.md)**, not here — this file
+is the original brief for executing the plan, and the plan is done.

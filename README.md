@@ -80,6 +80,9 @@ We treat documentation as a first-class citizen. Detailed technical deep-dives a
 ```text
 Trading-Ecosystem/
 ├── README.md               # This file
+├── LICENSE                 # MIT
+├── requirements.txt        # Python deps (TUI + plotting only)
+├── config.env              # single config source: bash sources it, C++ getenv()s it, Python reads it
 ├── docs/                   # Detailed technical documentation
 │   ├── architecture.md
 │   ├── benchmarks.md
@@ -100,7 +103,12 @@ Trading-Ecosystem/
 ├── hft-trading-firm/       # Client Simulator (Load Generator, Batching)
 │   ├── src/
 │   └── CMakeLists.txt
-└── scripts/                # Bash automation and build scripts
+└── scripts/                # Automation, benchmarking and analysis
+    ├── run_sharding.sh           # documented benchmark entry point → results.txt
+    ├── decode_audit.py           # decodes order_audit.log (run_sharding.sh calls it)
+    ├── measure_throughput.py     # gateway ingest sweep → benchmark_results.txt
+    ├── plot.py                   # charts from results.txt
+    └── setup_isolcpus.sh         # CPU isolation for measurement runs
 ```
 
 ## 6. Build & Run
@@ -125,12 +133,19 @@ cat results.txt
 ### Python monitoring layer (optional)
 The C++ engine above needs nothing from Python. The `monitoring/` package is
 stdlib-only through tier 4; only the live TUI (`rich`) and the plotting script
-(`matplotlib`) have external dependencies.
-```bash
-python3 -m pip install -r requirements.txt   # rich + matplotlib
+(`matplotlib`) have external dependencies, so the test suite runs with nothing
+installed at all — it skips the modules whose dependencies are missing.
 
-python3 -m monitoring.run_tests              # module self-tests (skips what isn't installed)
-python3 -m monitoring.tui.app                # live dashboard against a running engine
+```bash
+python3 -m monitoring.run_tests              # works as-is; skips the TUI without rich
+
+# For the TUI and plots, use a virtual environment. Debian/Ubuntu refuse
+# system-wide pip installs (PEP 668), so this is the portable route:
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt    # rich + matplotlib
+
+.venv/bin/python -m monitoring.run_tests     # full suite, nothing skipped
+.venv/bin/python -m monitoring.tui.app       # live dashboard against a running engine
 ```
 
 ### Sample Benchmark Output

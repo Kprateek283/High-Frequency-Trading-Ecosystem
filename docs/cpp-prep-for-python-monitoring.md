@@ -165,7 +165,8 @@ the TUI's trade-tape/replay features directly.
 ## 6. Externalize configuration
 
 **Problem.** Key parameters are hardcoded or half-env:
-- TCP `9091`, UDP `9092` (`app/exchange.cpp:83`, `tcp_server.h:78`)
+- TCP `9091` — order entry (the duplicate UDP order path on `9092` has since been deleted;
+  the only remaining UDP socket is market-data multicast, which is a different thing)
 - Multicast `239.255.0.1:12345` (`publisher.h:29`)
 - `NUM_SHARDS = 4` compiled in (`exchange.cpp:61`, `tcp_server.h:20`)
 - `GATEWAY_THREADS` via env only (`tcp_server.h:36`)

@@ -96,7 +96,7 @@ struct OuchEnterOrder {
     char order_token[14];    // Client Order ID (String)
     char side;               // 'B' or 'S'
     uint32_t shares;         // Quantity
-    char stock[8];           // e.g. "AAPL    "
+    char stock[8];           // canonical only: "STK00000".."STK00255" (encode_symbol)
     uint32_t price;          // Price (implied 4 decimal places)
     uint32_t time_in_force;  // 99998 = DAY
     char firm[4];            // "MPID"
