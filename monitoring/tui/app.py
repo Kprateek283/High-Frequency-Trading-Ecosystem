@@ -25,7 +25,7 @@ from ..feeds.stats_reader import StatsReader
 from ..feeds.audit_reader import AuditReader
 from ..feeds.multicast import MulticastReader
 from ..core import metrics
-from ..core.orderbook import BookSet
+from ..core.orderbook import BookSet, DEFAULT_ORDER_TTL_S
 from .. import wire, health
 
 
@@ -42,10 +42,17 @@ class _BookFeed:
     UI borrows a consistent view through `top_of_book`.
     """
 
-    def __init__(self, mcast):
+    # How often to sweep for orders stranded by a lost removal. Cheap (a scan of
+    # the resting orders) and the damage it repairs accrues slowly.
+    SWEEP_INTERVAL_S = 5.0
+
+    def __init__(self, mcast, order_ttl_s=DEFAULT_ORDER_TTL_S):
         self.mcast = mcast
         self.books = BookSet()
         self.applied = 0
+        self.evicted = 0                  # orders dropped as stranded — see _sweep
+        self.order_ttl_s = order_ttl_s
+        self._next_sweep = time.monotonic() + self.SWEEP_INTERVAL_S
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="itch-reader", daemon=True)
@@ -62,7 +69,24 @@ class _BookFeed:
                         self.books.apply(m)
                         self.applied += 1
             except OSError:
-                continue          # nothing available this instant — keep reading
+                pass              # nothing available this instant — keep reading
+            if time.monotonic() >= self._next_sweep:
+                self._sweep()
+
+    def _sweep(self):
+        """Undo what lost messages leave behind.
+
+        Dropped market data is silent (no wire sequence numbers), so an order
+        whose 'E'/'X' never arrived would rest here forever — growing memory and,
+        if it sits at a better price than the live market, permanently shadowing
+        the true top of book. Repair a crossed book at once, since a cross is
+        proof of a phantom, and age out anything untouched for too long.
+        """
+        now = time.monotonic()
+        with self._lock:
+            self.evicted += self.books.repair_crossed()
+            self.evicted += self.books.evict_stale(now, self.order_ttl_s)
+        self._next_sweep = now + self.SWEEP_INTERVAL_S
 
     def top_of_book(self, limit=10):
         """Snapshot of the first `limit` instruments, taken under the lock."""
@@ -272,11 +296,39 @@ def _feed_stops_cleanly():
     return True
 
 
+def _feed_heals_a_stranded_order():
+    """Regression: the feed's sweep must undo what a lost removal leaves behind.
+
+    Feeds a phantom bid whose execute never arrives, then a live ask below it —
+    a crossed book, which the engine could never produce, so it is proof of a
+    stranded order. The sweep must clear it rather than let it shadow the top of
+    book until the TTL expires.
+    """
+    class IdleMcast:
+        def poll(self):
+            raise BlockingIOError
+            yield                                  # pragma: no cover - generator
+
+    feed = _BookFeed(IdleMcast())
+    # Stamp both as recent, so the TTL sweep leaves them alone and only the
+    # crossed-book repair can act. The phantom is the older of the two.
+    now = time.monotonic()
+    feed.books.apply(wire.ItchMessage("A", 0, 0, 0, 1, 10, 50500, "B"), now=now - 10.0)
+    feed.books.apply(wire.ItchMessage("A", 0, 0, 0, 2, 10, 50000, "S"), now=now)
+    b = feed.books.books[0]
+    assert b.best_bid() == 50500 and b.best_ask() == 50000     # crossed: impossible for real
+    feed._sweep()
+    assert feed.evicted == 1
+    assert b.best_bid() is None and b.best_ask() == 50000      # phantom gone, live ask kept
+    return True
+
+
 def _selftest():
     assert _render_once_headless()
     assert _feed_keeps_up_with_a_burst()
     assert _feed_stops_cleanly()
-    print("tui: OK (headless render, burst-proof feed, clean stop)")
+    assert _feed_heals_a_stranded_order()
+    print("tui: OK (headless render, burst-proof feed, clean stop, self-healing book)")
 
 
 if __name__ == "__main__":
