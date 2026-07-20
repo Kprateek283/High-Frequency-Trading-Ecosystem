@@ -5,6 +5,7 @@
 #include <atomic>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <iostream>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -46,6 +47,7 @@ private:
     std::atomic<bool>& running;
     
     int fd;
+    std::string log_path;              // from AUDIT_LOG_PATH, else the default
     void* mmap_base = MAP_FAILED;
     AuditLogHeader* header = nullptr;
     OrderLogEntry* mmap_entries = nullptr;
@@ -70,9 +72,16 @@ public:
                  std::atomic<bool>& r)
         : drop_copy_queues(dcq), gw_reject_queues(reject_qs), tsc_queues(tq), timer(tmr), running(r) {
         
-        fd = open("order_audit.log", O_RDWR | O_CREAT | O_TRUNC, 0666);
+        // Same config source as everything else (config.env / getenv, §6). The
+        // path was hardcoded here while monitoring/config.py honoured
+        // AUDIT_LOG_PATH, so changing it pointed writer and readers at different
+        // files with nothing to report the mismatch.
+        const char* env_path = std::getenv("AUDIT_LOG_PATH");
+        log_path = (env_path && *env_path) ? env_path : "order_audit.log";
+
+        fd = open(log_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
         if (fd == -1) {
-            throw std::runtime_error("Failed to open order audit log");
+            throw std::runtime_error("Failed to open order audit log: " + log_path);
         }
 
         size_t total = sizeof(AuditLogHeader) + MAX_LOG_ENTRIES * sizeof(OrderLogEntry);
@@ -106,7 +115,7 @@ public:
             // Best-effort: a failed trim leaves trailing zeroed entries, which readers
             // already ignore because they bound their scan by write_index.
             if (ftruncate(fd, sizeof(AuditLogHeader) + log_index * sizeof(OrderLogEntry)) != 0) {
-                perror("ftruncate(order_audit.log)");
+                perror(("ftruncate(" + log_path + ")").c_str());
             }
             close(fd);
         }
