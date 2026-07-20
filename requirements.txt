@@ -1,0 +1,15 @@
+# Python dependencies for the monitoring layer and the plotting script.
+#
+# Tiers 0-4 of monitoring/ (wire, config, models, clock, feeds, core, health,
+# orchestrator) are deliberately stdlib-only -- see decision #6 in
+# docs/agent-handoff.md -- so everything below is optional depending on what you
+# actually run:
+#
+#   rich        monitoring/tui  (the live dashboard)
+#   matplotlib  scripts/plot.py (benchmark charts; imported lazily, and the
+#               script degrades to a text summary without it)
+#
+# Install:  python3 -m pip install -r requirements.txt
+
+rich>=13.0
+matplotlib>=3.5
