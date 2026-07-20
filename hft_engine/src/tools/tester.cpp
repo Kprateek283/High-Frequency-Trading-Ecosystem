@@ -35,9 +35,8 @@ int main() {
         token.insert(token.begin(), 14 - token.length(), '0');
         std::memcpy(orders[i].order_token, token.c_str(), 14);
         
-        orders[i].side = (i % 2 == 0) ? 'B' : 'S';
         orders[i].shares = 10;
-        
+
         // The gateway accepts instruments [0, MAX_INSTRUMENTS). This used to be
         // 1000, so ~74% of the tester's orders named symbols the engine rejects
         // outright and the benchmark measured the reject path (review A2).
@@ -62,7 +61,21 @@ int main() {
         }
 
         encode_symbol(orders[i].stock, static_cast<uint16_t>(sym_id));
-        
+
+        // Side must not come from `i % 2` under workload 1: that walks symbols
+        // with `i % num_symbols`, and num_symbols is even, so every order for a
+        // given symbol shares i's parity and therefore its side. The book could
+        // never cross -- a 1M-order run reported 0 matches and silently measured
+        // the insert-only path. Deriving the side from the sweep number flips it
+        // on each pass over the symbol list, so a symbol sees both sides.
+        // Workloads 2-4 pick symbols at random, so plain alternation is fine and
+        // is kept to preserve their measured behaviour.
+        if (workload == 1) {
+            orders[i].side = ((i / num_symbols) % 2 == 0) ? 'B' : 'S';
+        } else {
+            orders[i].side = (i % 2 == 0) ? 'B' : 'S';
+        }
+
         if (workload == 4) {
             orders[i].price = 1 + (rand() % 99999);
         } else {
