@@ -9,6 +9,12 @@ from .core import metrics
 # Tunable ceilings. Queues are sized 2^20; heartbeat is written every OrderManager
 # loop, so anything past ~half a second means the drain has stalled.
 HEARTBEAT_STALE_NS = 500_000_000        # 0.5s
+# A heartbeat timestamped slightly ahead of us is ordinary jitter: the engine and
+# this reader sample the clock at different instants. A large negative age is not
+# jitter -- it means the TSC anchor is wrong, so every timestamp we convert is
+# wrong. Report it, because the staleness test above cannot: it only fires on
+# ages that are too POSITIVE, so a drifting anchor reads as healthy forever.
+HEARTBEAT_SKEW_NS = 50_000_000          # 50ms
 QUEUE_DEPTH_WARN = 100_000              # ~10% of a 2^20 queue
 POOL_HEADROOM_WARN = 0.10               # < 10% free
 
@@ -28,6 +34,12 @@ def assess(snap, clock, now_tsc):
     if age > HEARTBEAT_STALE_NS:
         overall = _worst(overall, CRITICAL)
         reasons.append(f"heartbeat stale ({age/1e6:.0f}ms)")
+    elif age < -HEARTBEAT_SKEW_NS:
+        # WARN, not CRITICAL: the engine may be perfectly healthy. What is broken
+        # is our ability to judge it, so say that rather than implying an outage.
+        overall = _worst(overall, WARN)
+        reasons.append(f"heartbeat {abs(age)/1e6:.0f}ms in the future "
+                       f"— TSC anchor skew, timing is unreliable")
 
     if snap.dropped_reports or snap.dropped_drop_copies:
         overall = _worst(overall, WARN)
@@ -71,6 +83,15 @@ def _selftest():
     # stale heartbeat → CRITICAL
     r = assess(good, c, now_tsc=1_000_000_000 + 600_000_000)   # 0.6s old
     assert r["overall"] == CRITICAL and "heartbeat" in r["reasons"][0]
+
+    # heartbeat from the future → WARN, not a silent OK (D2). A drifting TSC
+    # anchor produces exactly this, and the staleness test above cannot see it.
+    r = assess(good, c, now_tsc=1_000_000_000 - 200_000_000)   # 0.2s in the future
+    assert r["overall"] == WARN, "future heartbeat must not read as healthy"
+    assert "future" in r["reasons"][0]
+    # small skew is ordinary jitter and must stay quiet
+    r = assess(good, c, now_tsc=1_000_000_000 - 1_000_000)     # 1ms in the future
+    assert r["overall"] == OK and not r["reasons"]
 
     # deep queue → WARN; near-full pool → CRITICAL; a drop → WARN reason present
     bad = NS(shards=[shard(hw=495000, eq=200_000)], dropped_reports=5, dropped_drop_copies=0,
