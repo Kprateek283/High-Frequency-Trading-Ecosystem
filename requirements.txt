@@ -9,7 +9,14 @@
 #   matplotlib  scripts/plot.py (benchmark charts; imported lazily, and the
 #               script degrades to a text summary without it)
 #
-# Install:  python3 -m pip install -r requirements.txt
+# The test suite needs none of this: run_tests skips a module whose dependency is
+# absent, so tiers 0-4 stay verifiable on a bare interpreter.
+#
+# Install into a virtual environment. Debian/Ubuntu mark the system interpreter
+# externally-managed (PEP 668) and refuse a system-wide install outright:
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
 
 rich>=13.0
 matplotlib>=3.5
