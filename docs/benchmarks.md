@@ -13,12 +13,19 @@ Instead, the system is intentionally stressed under massive sustained load (1,00
 ## Test Environment
 
 ### Hardware
-*   **CPU:** Intel Core i5-1240P (~4.4 GHz Max Turbo)
+*   **CPU:** Intel Core i5-1240P. Cycles→time conversions use the **measured TSC
+    frequency** the engine calibrates at startup (`core/timer.h`), not the 4.4 GHz
+    single-core turbo ceiling from the spec sheet — sustained all-core clock on this
+    part is ~4.0 GHz, and the calibrated value is the only one that matters for
+    TSC-based timing.
 *   **Memory Architecture:** Unified NUMA node
 
 ### Software
 *   **OS:** Ubuntu 24.04.3 LTS (Linux Kernel)
-*   **Compiler:** GCC / Clang (C++17/20, `-O3` Release Mode)
+*   **Compiler:** GCC / Clang, C++20. Both projects now build with the **same**
+    release flags — `-O3 -march=native -flto -DNDEBUG` and `-Wall -Wextra -Werror
+    -Wpedantic` (unified in Phase 0.1; the engine previously carried no flags of its
+    own, so every pre-fix number was measured on an unoptimised engine).
 
 ## Measurement Methodology
 
@@ -26,66 +33,136 @@ Instead, the system is intentionally stressed under massive sustained load (1,00
 Standard timing APIs introduce measurable observer overhead relative to direct TSC reads. To achieve true cycle-accurate profiling without inflating latency (the Heisenberg effect), the system injects the x86 hardware intrinsic `__rdtscp` directly into the packet payloads. 
 
 ### Latency Attribution
-This allows us to track the exact lifecycle of an order across thread and network boundaries, decomposing the latency into its constituent parts:
-1.  **TCP Path:** Network traversal and kernel queueing.
-2.  **SPSC Queue:** Lock-free inter-thread handoff.
-3.  **Trading Engine:** Application business logic (Risk + Matching).
+Five cycle-timestamps track an order across thread and network boundaries: four ride on
+the wire in `OuchEnterOrder` (`t1_exchange_send` … `t4_network_deq`) and the gateway
+stamps a fifth (`t5`) when `read()` returns; the engine separately pairs a per-task
+`ingress_tsc` with a match-time `get_tsc()`. See [`telemetry.md`](./telemetry.md) for the
+full five-point decomposition. From these we isolate:
+1.  **TCP Path:** Network traversal and kernel queueing (`t5 - t4_network_deq`).
+2.  **SPSC Queue + handoff:** Lock-free inter-thread handoff.
+3.  **Trading Engine:** Application business logic — Risk + Matching (`ingress_tsc → match`).
 
 ---
 
 ## Gateway Cycle Attribution
-Before analyzing macro-level throughput, we must understand where the CPU cycles are being spent at a micro-level. 
-The following data was captured at the optimal **4-Thread configuration processing 10,000,000 messages per second**.
 
-![Gateway Cycle Attribution](images/cycle_attribution.png)
+The gateway maintains per-stage cycle accumulators — `total_read_cycles`,
+`total_decode_cycles`, `total_validation_cycles`, `total_enqueue_cycles` — over the live
+decode path (`gateway/tcp_server.h`), exported in the shutdown stats and the `/dev/shm`
+stats region. The micro-level split (`epoll_wait` / `read` / Decode / Validate / Enqueue)
+and the kernel-vs-application percentage come straight from these counters.
 
-| Pipeline Stage | Cycle Cost | Percentage | Description |
-| :--- | :--- | :--- | :--- |
-| **`epoll_wait()`** | 1,157 cycles | ~70% | Kernel: Polling for socket events |
-| **`read()`** | 124 cycles | ~7.5% | Kernel: Copying data to userspace |
-| **Decode** | 82 cycles | ~5% | Application: Parsing binary OUCH protocol |
-| **Validation** | 27 cycles | ~1.6% | Application: Pre-trade risk checks |
-| **Enqueue** | 258 cycles | ~15.6% | Application: Push to Lock-Free SPSC Queue |
-| **Total Cost** | **1,650 cycles** | **100%** | Total CPU cycles per order |
+Measured on the development box after the Phase-0/1/3 work, from the counters above:
 
-**Engineering Insight:** The actual application business logic (Decode + Validate + Enqueue) executes in **~367 CPU cycles** (sub-100ns on this test machine). The Linux kernel networking stack (`epoll_wait` + `read`) accounts for **~77%** of the total ingestion overhead.
+| Stage | Cycles/order |
+| :--- | ---: |
+| Decode | ~82 |
+| Validate | ~24 |
+| Enqueue | ~340 |
+
+These three are the most trustworthy figures here: they count instruction work per
+order rather than wall-clock contention, and they held within ~4% across runs on a
+loaded machine. `epoll_wait` and `read` dominate the total (tens of thousands of
+cycles/order) and are *not* quoted, because those are exactly the kernel-path costs
+that a loaded, non-isolated box distorts.
 
 ---
 
 ## Capacity Scaling Matrix
 
-This full matrix demonstrates system performance across various scaling vectors, validating the `SO_REUSEPORT` architectural decisions.
+The matrix sweeps load (1M–10M msgs/sec) × gateway threads (1/2/4/8), recording per row the
+TCP path, engine cycles, end-to-end latency, and the accepted/rejected split.
 
-![Capacity Scaling Matrix](images/latency_scaling.png)
+### Ingest throughput (measured)
 
-| Load (msgs/sec) | Gateway Threads | TCP Path (Queueing) | Engine Logic | End-to-End Latency | Status |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **1,000,000** | 1 | 34,837 cycles | 4,664 cycles | 1,116,847 cycles | Stable |
-| **1,000,000** | 2 | 33,542 cycles | 4,868 cycles | 1,154,419 cycles | Stable |
-| **1,000,000** | 4 | 39,363 cycles | 3,582 cycles | 1,113,762 cycles | Stable |
-| **1,000,000** | 8 | 44,869 cycles | 4,304 cycles | 1,087,882 cycles | Stable |
-| **2,000,000** | 1 | 71,818 cycles | 4,936 cycles | 1,302,838 cycles | Stable |
-| **2,000,000** | 2 | 50,510 cycles | 4,249 cycles | 958,715 cycles | Stable |
-| **2,000,000** | 4 | 82,830 cycles | 4,360 cycles | 1,179,687 cycles | Stable |
-| **2,000,000** | 8 | 372,544 cycles | 4,364 cycles | 1,365,468 cycles | Degraded (Oversubscription Effects) |
-| **5,000,000** | 1 | 195,671,018 cycles | 4,997 cycles | 196,813,156 cycles | Saturation (Queueing Delay) |
-| **5,000,000** | 2 | 511,845 cycles | 5,587 cycles | 1,602,905 cycles | Stable |
-| **5,000,000** | 4 | 416,071 cycles | 5,170 cycles | 1,692,150 cycles | Stable |
-| **5,000,000** | 8 | 498,648 cycles | 4,925 cycles | 1,511,991 cycles | Stable |
-| **10,000,000** | 1 | 242,392,082 cycles | 5,604 cycles | 243,483,071 cycles | Saturation (Queueing Delay) |
-| **10,000,000** | 2 | 781,801 cycles | 5,727 cycles | 1,840,357 cycles | Stable |
-| **10,000,000** | 4 | **456,058 cycles** | **4,415 cycles** | **1,422,379 cycles** | **Optimal Balance** |
-| **10,000,000** | 8 | 314,940 cycles | 5,470 cycles | 1,588,183 cycles | CPU Oversubscription |
+`scripts/measure_throughput.py` sweeps workers × concurrent clients and writes
+`benchmark_results.txt`. It samples `orders_in` from the stats region rather than
+trusting the client's reported rate — `send()` returns once the data is buffered, so
+client-side "throughput" is offered load, not work the engine did. (The tester
+happily reports ~2.6M orders/s while the engine consumes ~0.2M.)
+
+| Gateway workers | Concurrent clients | Ingest (orders/sec) |
+| ---: | ---: | ---: |
+| 1 | 1 | ~207,000 |
+| 4 | 1 | ~215,000 |
+| 4 | 2 | ~587,000 |
+| 4 | 4 | **~1,081,000** |
+| 4 | 8 | ~1,068,000 |
+
+Two things fall out of this:
+
+**`SO_REUSEPORT` shards by connection, not by packet.** 4 workers with a single
+client performs the same as 1 worker (215k vs 207k) because the accepted connection
+is pinned to one worker and the other three idle. Multi-connection load is a
+prerequisite for gateway scaling, and any load generator that opens one socket will
+silently measure a single worker.
+
+**Ingest saturates around 4 concurrent clients** on this machine (1.08M → 1.07M from
+4 to 8), consistent with oversubscription once gateway workers, engine shards, and
+the load generators together exceed the available cores.
+
+> **This is a lower bound, not a capacity figure.** The run had no `SCHED_FIFO`
+> privilege, a `powersave` governor, and other applications running; the environment
+> is recorded in the header of `benchmark_results.txt`. Treat the *shape* as the
+> result and re-run the script on isolated hardware for a real ceiling.
+>
+> **End-to-end latency remains `TODO(measure)`, deliberately.** Tail latency measures
+> exactly what arbitrary preemption ruins, and this box cannot grant `SCHED_FIFO`
+> (`ulimit -r` is 0). p99/p99.9 numbers taken here would describe the Linux scheduler,
+> not the engine — the same class of misleading figure this project already removed
+> once (review B9). The 1M–10M msgs/sec × threads matrix likewise stays open.
+
+### What *was* verified (functional run, `results.txt`)
+
+A 4-thread gateway run through the fixed pipeline now matches orders instead of rejecting
+them — the accepted/rejected split A2 asked for:
+
+| Metric | Value |
+| :--- | ---: |
+| Gateway Threads | 4 |
+| Orders (NEW) | 10,000 |
+| Matches (FILLED) | 20,000 |
+| PARTIAL_FILL / CANCELED | 0 / 0 |
+| **REJECTED** | **0** |
+
+Reject rate is now **0%** — a property of the workload fitting the 256-instrument cap with
+symbols that decode, not of a parsing failure (contrast the pre-fix 74.4% reject rate in
+review A2). Ingest throughput for the gateway is measured above; end-to-end latency for
+this run is `TODO(measure)`.
 
 ---
 
 ## Key Findings
 
-1. **Single-Thread epoll Ceiling:** A single `epoll` ingestion loop hits its capacity threshold near 4M msgs/sec. Pushing 5M or 10M messages into a single gateway thread causes sustained TCP receive-buffer saturation and severe queueing delay.
-2. **Queueing Delay Dominates Latency:** At 10M msgs/sec on 1 thread, the Trading Engine logic remains blazing fast (~5,600 cycles), but the TCP Queueing Delay spikes to over 240,000,000 cycles (~60ms). Under network saturation, queueing delay fundamentally dictates end-to-end performance.
-3. **SO_REUSEPORT Scalability:** Distributing the TCP ingress load across multiple shards reduces queueing delay by several orders of magnitude. Shifting from 1 to 4 threads at 10M msgs/sec erased the 60ms delay, restoring end-to-end latency to ~355µs.
-4. **The 4-Thread Sweet Spot:** For this specific machine (Intel i5-1240P), four Gateway threads provided the optimal balance between aggregate throughput and individual cycle efficiency.
-5. **Thread Oversubscription Penalties:** Additional Gateway threads (e.g., 8 threads) caused diminishing returns. The combination of 8 Gateways + 8 Engines + the Load Generator physically oversubscribed the cores, increasing latency via L3 cache contention and OS scheduler overhead.
+*Items 1, 4 and 5 are measured (see the table above). Items 2 and 3 concern latency and
+remain design predictions — this box cannot measure them, see the `SCHED_FIFO` note.*
+
+1. **Single-connection ceiling is real, but it is not an `epoll` limit.** A single
+   client tops out near 207–215k orders/sec whether the gateway runs 1 or 4 workers.
+   The cause is connection-level sharding, not the ingestion loop: `SO_REUSEPORT`
+   pins an accepted connection to one worker. Concurrency has to come from
+   connections.
+2. **Queueing Delay Dominates Latency:** under saturation the engine logic is expected
+   to stay flat while TCP queueing delay balloons — queueing, not execution, dictating
+   end-to-end latency. Unverified here (`TODO(measure)`).
+3. **SO_REUSEPORT Scalability:** spreading ingress across workers is expected to cut
+   queueing delay substantially. Its *throughput* effect is confirmed (5× from 1 to 4
+   clients); its *latency* effect is `TODO(measure)`.
+4. **The 4-Thread Operating Point:** four gateway threads with four concurrent clients
+   is where ingest peaks on this machine (~1.08M orders/sec), and adding clients past
+   that does not help — so the Phase-3.3 default is the right operating point here.
+5. **Thread Oversubscription:** confirmed directionally — going from 4 to 8 concurrent
+   clients slightly *reduces* ingest (1.08M → 1.07M) as gateway workers, engine shards
+   and load generators contend for the same cores.
 
 ## Conclusions
-The system successfully met its goal of processing 10,000,000 messages per second. At the optimal 4-thread configuration, the system sustained 10,000,000 messages/sec while maintaining end-to-end latency of 1.42M cycles and core business-logic execution of approximately 350–370 cycles. The profiling indicates that the primary scaling bottleneck lies outside the application business logic and within the kernel networking path, laying the groundwork for future exploration of kernel-bypass technologies such as DPDK or ef_vi.
+The functional goal — a documented run that actually matches orders through the full
+pipeline — is met (`results.txt`: 4 threads, 10,000 orders, 20,000 fills, 0 rejects).
+Gateway ingest is measured at **~1.08M orders/sec** on a developer desktop
+(`benchmark_results.txt`), scaling 5× with concurrent connections and saturating at
+four. The latency campaign stays open: it needs a box that can grant `SCHED_FIFO`.
+
+The design thesis is supported so far and unchanged: application-side work per order is
+small and stable (~82/24/340 cycles for decode/validate/enqueue) while the kernel
+networking path dominates the per-order total, which is what motivates the future
+kernel-bypass work (DPDK / ef_vi).

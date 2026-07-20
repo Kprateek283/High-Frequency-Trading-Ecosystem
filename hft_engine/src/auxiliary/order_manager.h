@@ -1,33 +1,56 @@
 #pragma once
 #include <array>
+#include <vector>
 #include <thread>
 #include <atomic>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <iostream>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include "core/lock_free_queue.h"
 #include "matching/order.h"
+#include "matching/engine.h"   // TscTuple, used in the queue members below
 
 #include "core/timer.h"
+#include "core/stats_region.h"
 
 struct OrderLogEntry {
     uint64_t timestamp_tsc;
     DropCopyMessage msg;
 };
 
+// Fixed 64-byte header at the start of order_audit.log. write_index is published
+// after every appended entry, so an external reader (e.g. the Python monitor) can
+// tail the log while the engine runs, and it survives a crash — unlike the old
+// scheme where the valid count was only written to the file size on clean shutdown.
+constexpr uint64_t AUDIT_LOG_MAGIC = 0x48465441554401ULL; // "HFTAUD" + version byte
+struct alignas(64) AuditLogHeader {
+    uint64_t magic;                    // AUDIT_LOG_MAGIC
+    uint32_t version;                  // format version
+    uint32_t entry_size;              // sizeof(OrderLogEntry), for reader self-check
+    std::atomic<uint64_t> write_index; // count of valid entries committed so far
+};
+static_assert(sizeof(AuditLogHeader) == 64, "AuditLogHeader must be exactly one cache line");
+static_assert(alignof(OrderLogEntry) <= 64 && (64 % alignof(OrderLogEntry)) == 0,
+              "entries must stay aligned when placed right after the header");
+
 template<int NUM_SHARDS>
 class OrderManager {
 private:
     std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS>& drop_copy_queues;
+    std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& gw_reject_queues;
     std::array<std::unique_ptr<LockFreeQueue<TscTuple, 1048576>>, NUM_SHARDS>& tsc_queues;
     Timer& timer;
     std::atomic<bool>& running;
     
     int fd;
-    OrderLogEntry* mmap_log;
+    std::string log_path;              // from AUDIT_LOG_PATH, else the default
+    void* mmap_base = MAP_FAILED;
+    AuditLogHeader* header = nullptr;
+    OrderLogEntry* mmap_entries = nullptr;
     size_t log_index = 0;
     const size_t MAX_LOG_ENTRIES = 20000000; // 20 million events capacity
 
@@ -35,37 +58,65 @@ private:
     uint64_t trades = 0;
     uint64_t rejects = 0;
 
+    HftStatsRegion* stats = nullptr;   // optional; set before run()
+
 public:
-    OrderManager(std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS>& dcq, 
+    // Wire in the shared-memory stats region. Optional: if never set, the engine
+    // runs exactly as before with no region writes.
+    void set_stats_region(HftStatsRegion* r) { stats = r; }
+
+    OrderManager(std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS>& dcq,
+                 std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& reject_qs,
                  std::array<std::unique_ptr<LockFreeQueue<TscTuple, 1048576>>, NUM_SHARDS>& tq,
                  Timer& tmr,
-                 std::atomic<bool>& r) 
-        : drop_copy_queues(dcq), tsc_queues(tq), timer(tmr), running(r) {
+                 std::atomic<bool>& r)
+        : drop_copy_queues(dcq), gw_reject_queues(reject_qs), tsc_queues(tq), timer(tmr), running(r) {
         
-        fd = open("order_audit.log", O_RDWR | O_CREAT | O_TRUNC, 0666);
+        // Same config source as everything else (config.env / getenv, §6). The
+        // path was hardcoded here while monitoring/config.py honoured
+        // AUDIT_LOG_PATH, so changing it pointed writer and readers at different
+        // files with nothing to report the mismatch.
+        const char* env_path = std::getenv("AUDIT_LOG_PATH");
+        log_path = (env_path && *env_path) ? env_path : "order_audit.log";
+
+        fd = open(log_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0666);
         if (fd == -1) {
-            throw std::runtime_error("Failed to open order audit log");
+            throw std::runtime_error("Failed to open order audit log: " + log_path);
         }
-        
-        size_t size = MAX_LOG_ENTRIES * sizeof(OrderLogEntry);
-        if (ftruncate(fd, size) != 0) {
+
+        size_t total = sizeof(AuditLogHeader) + MAX_LOG_ENTRIES * sizeof(OrderLogEntry);
+        if (ftruncate(fd, total) != 0) {
             close(fd);
             throw std::runtime_error("Failed to set size for order audit log");
         }
-        
-        mmap_log = (OrderLogEntry*)mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        if (mmap_log == MAP_FAILED) {
+
+        mmap_base = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mmap_base == MAP_FAILED) {
             close(fd);
             throw std::runtime_error("Failed to mmap order audit log");
         }
+        header = reinterpret_cast<AuditLogHeader*>(mmap_base);
+        mmap_entries = reinterpret_cast<OrderLogEntry*>(
+            reinterpret_cast<char*>(mmap_base) + sizeof(AuditLogHeader));
+
+        header->magic = AUDIT_LOG_MAGIC;
+        header->version = 1;
+        header->entry_size = sizeof(OrderLogEntry);
+        header->write_index.store(0, std::memory_order_release);
     }
-    
+
     ~OrderManager() {
-        if (mmap_log != MAP_FAILED) {
-            munmap(mmap_log, MAX_LOG_ENTRIES * sizeof(OrderLogEntry));
+        size_t total = sizeof(AuditLogHeader) + MAX_LOG_ENTRIES * sizeof(OrderLogEntry);
+        if (mmap_base != MAP_FAILED) {
+            munmap(mmap_base, total);
         }
         if (fd != -1) {
-            ftruncate(fd, log_index * sizeof(OrderLogEntry));
+            // Trim to header + the entries actually written (readers use write_index).
+            // Best-effort: a failed trim leaves trailing zeroed entries, which readers
+            // already ignore because they bound their scan by write_index.
+            if (ftruncate(fd, sizeof(AuditLogHeader) + log_index * sizeof(OrderLogEntry)) != 0) {
+                perror(("ftruncate(" + log_path + ")").c_str());
+            }
             close(fd);
         }
     }
@@ -80,23 +131,50 @@ public:
         
         while (running.load(std::memory_order_relaxed)) {
             bool found = false;
-            
-            // 1. Drain Drop Copy Queues
-            for (int i = 0; i < NUM_SHARDS; ++i) {
-                while (drop_copy_queues[i]->pop(msg)) {
-                    found = true;
-                    if (log_index < MAX_LOG_ENTRIES) {
-                        mmap_log[log_index].timestamp_tsc = __builtin_ia32_rdtsc();
-                        mmap_log[log_index].msg = msg;
-                        log_index++;
-                    }
-                    
-                    if (msg.state == OrderState::NEW) new_orders++;
-                    else if (msg.state == OrderState::FILLED || msg.state == OrderState::PARTIAL_FILL) trades++;
-                    else if (msg.state == OrderState::REJECTED) rejects++;
+
+            // Liveness heartbeat (4.5): the monitor treats a stale value as a
+            // stalled drain. Cheap enough to write every iteration.
+            if (stats) stats->heartbeat_tsc.store(get_tsc(), std::memory_order_relaxed);
+
+            // 1. Drain Drop Copy Queues (engine-produced: NEW / FILL / CANCEL)
+            //    and the per-worker gateway reject queues (pre-trade REJECTED).
+            //    Each queue has exactly one producer, preserving the SPSC contract.
+            auto consume = [&](DropCopyMessage& m) {
+                found = true;
+                if (log_index < MAX_LOG_ENTRIES) {
+                    mmap_entries[log_index].timestamp_tsc = __builtin_ia32_rdtsc();
+                    mmap_entries[log_index].msg = m;
+                    log_index++;
+                    // Publish the entry (release) so a reader that acquire-loads
+                    // write_index sees fully-written entry data below it.
+                    header->write_index.store(log_index, std::memory_order_release);
                 }
+
+                if (m.state == OrderState::NEW) new_orders++;
+                else if (m.state == OrderState::FILLED || m.state == OrderState::PARTIAL_FILL) trades++;
+                else if (m.state == OrderState::REJECTED) rejects++;
+
+                // Cumulative per-shard counters in the stats region (4.3). Monotonic
+                // relaxed fetch_adds by this single thread; the shard is derived from
+                // the message's instrument the same way the gateway routes it. Python
+                // reads these directly (they only rise); the sampled block below is
+                // what the seqlock protects.
+                if (stats) {
+                    ShardStats& S = stats->shards[m.instrument_id % NUM_SHARDS];
+                    if (m.state == OrderState::NEW) S.orders_in.fetch_add(1, std::memory_order_relaxed);
+                    else if (m.state == OrderState::FILLED || m.state == OrderState::PARTIAL_FILL) S.fills.fetch_add(1, std::memory_order_relaxed);
+                    else if (m.state == OrderState::CANCELED) S.cancels.fetch_add(1, std::memory_order_relaxed);
+                    else if (m.state == OrderState::REJECTED) S.rejects.fetch_add(1, std::memory_order_relaxed);
+                }
+            };
+
+            for (int i = 0; i < NUM_SHARDS; ++i) {
+                while (drop_copy_queues[i]->pop(msg)) consume(msg);
             }
-            
+            for (auto& rq : gw_reject_queues) {
+                while (rq->pop(msg)) consume(msg);
+            }
+
             // 2. Drain TSC Queues for Latency Metrics
             for (int i = 0; i < NUM_SHARDS; ++i) {
                 while (tsc_queues[i]->pop(t)) {

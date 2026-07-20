@@ -1,0 +1,5 @@
+build/
+.cache/
+*.log
+compile_commands.json
+credentials.txt

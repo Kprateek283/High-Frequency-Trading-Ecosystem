@@ -29,45 +29,53 @@ int main() {
     std::vector<OuchEnterOrder> orders(TOTAL_ORDERS);
     std::memset(orders.data(), 0, TOTAL_ORDERS * sizeof(OuchEnterOrder));
 
-    const char* stocks[4] = {"AAPL    ", "MSFT    ", "GOOG    ", "AMZN    "};
-
     for (int i = 0; i < TOTAL_ORDERS; ++i) {
         orders[i].msg_type = 'O';
         std::string token = std::to_string(i + 1);
         token.insert(token.begin(), 14 - token.length(), '0');
         std::memcpy(orders[i].order_token, token.c_str(), 14);
         
-        orders[i].side = (i % 2 == 0) ? 'B' : 'S';
         orders[i].shares = 10;
-        
-        int num_symbols = 1000;
+
+        // The gateway accepts instruments [0, MAX_INSTRUMENTS). This used to be
+        // 1000, so ~74% of the tester's orders named symbols the engine rejects
+        // outright and the benchmark measured the reject path (review A2).
+        const int num_symbols = MAX_INSTRUMENTS;
         int sym_id = 0;
         const char* wl = std::getenv("WORKLOAD_TYPE");
         int workload = wl ? std::atoi(wl) : 1;
-        
+
         if (workload == 1) { // Sequential
             sym_id = i % num_symbols;
         } else if (workload == 2) { // Uniform Random
             sym_id = rand() % num_symbols;
         } else if (workload == 3) { // Market Realistic Distribution
             int r = rand() % 100;
-            if (r < 20) sym_id = 0; // AAPL
-            else if (r < 35) sym_id = 1; // MSFT
-            else if (r < 50) sym_id = 2; // NVDA
-            else if (r < 60) sym_id = 3; // SPY
+            if (r < 20) sym_id = 0;
+            else if (r < 35) sym_id = 1;
+            else if (r < 50) sym_id = 2;
+            else if (r < 60) sym_id = 3;
             else sym_id = 4 + (rand() % (num_symbols - 4));
         } else if (workload == 4) { // Worst Case (random sym, random price)
             sym_id = rand() % num_symbols;
         }
-        
-        char stock_name[8] = {'S', 'T', 'K', '0', '0', '0', '0', '0'};
-        stock_name[7] = '0' + (sym_id % 10);
-        stock_name[6] = '0' + ((sym_id / 10) % 10);
-        stock_name[5] = '0' + ((sym_id / 100) % 10);
-        stock_name[4] = '0' + ((sym_id / 1000) % 10);
-        stock_name[3] = '0' + ((sym_id / 10000) % 10);
-        std::memcpy(orders[i].stock, stock_name, 8);
-        
+
+        encode_symbol(orders[i].stock, static_cast<uint16_t>(sym_id));
+
+        // Side must not come from `i % 2` under workload 1: that walks symbols
+        // with `i % num_symbols`, and num_symbols is even, so every order for a
+        // given symbol shares i's parity and therefore its side. The book could
+        // never cross -- a 1M-order run reported 0 matches and silently measured
+        // the insert-only path. Deriving the side from the sweep number flips it
+        // on each pass over the symbol list, so a symbol sees both sides.
+        // Workloads 2-4 pick symbols at random, so plain alternation is fine and
+        // is kept to preserve their measured behaviour.
+        if (workload == 1) {
+            orders[i].side = ((i / num_symbols) % 2 == 0) ? 'B' : 'S';
+        } else {
+            orders[i].side = (i % 2 == 0) ? 'B' : 'S';
+        }
+
         if (workload == 4) {
             orders[i].price = 1 + (rand() % 99999);
         } else {

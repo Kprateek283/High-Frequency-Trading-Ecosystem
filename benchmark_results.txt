@@ -1,0 +1,14 @@
+# Gateway ingest sweep  2026-07-20T18:47:36Z
+# cores=16 load1=1.90 governor=powersave rtprio_limit=0 isolcpus=2,4,6,10,12,14
+# orders/s measured from stats-region orders_in over a 1.5s window, 3 runs per point (median reported)
+#
+# workers  clients  median_orders_per_s  spread_pct
+        1        1               207439       14.3
+        4        1               214805        1.1
+        4        2               586878        4.5
+        4        4              1081109        8.9
+        4        8              1068082        7.9
+#
+# WARNING: this run had no SCHED_FIFO privilege and/or a scaling
+# governor. Treat the shape (does it scale?) as meaningful and the
+# absolute ceiling as a lower bound for this box only.
