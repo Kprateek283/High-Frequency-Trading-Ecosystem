@@ -22,8 +22,18 @@ def shard_rates(prev_shard, cur_shard, dt):
 
 
 def fill_ratio(shard):
-    """Cumulative fills / orders_in for one shard (0 when no orders yet)."""
-    return shard.fills / shard.orders_in if shard.orders_in else 0.0
+    """Fraction of this shard's order flow that filled, in [0, 1].
+
+    orders_in counts NEW reports; fills counts every FILLED/PARTIAL_FILL exec
+    report — and one crossing trade emits an exec on *both* sides against a
+    single shard's orders_in, so raw fills/orders_in can exceed 1.0 (seen as
+    "fill%: 200" on a fully-filled, no-partial shard). max(orders_in, fills)
+    clamps it to <=100%.
+    ponytail: a true "orders fully filled" counter needs a C++ stats field;
+    this clamp is the honest cosmetic fix until that's worth adding.
+    """
+    denom = max(shard.orders_in, shard.fills)
+    return shard.fills / denom if denom else 0.0
 
 
 def pool_headroom(shard, capacity=POOL_CAPACITY_PER_SHARD):
@@ -72,6 +82,7 @@ def _selftest():
     assert abs(s["shards"][0]["pool_headroom"] - 0.5) < 1e-9         # 250000/500000
     assert s["dropped_reports_delta"] == 2 and s["dropped_drop_copies_delta"] == 0
     assert fill_ratio(shard(0, 0)) == 0.0                            # no divide-by-zero
+    assert fill_ratio(shard(100, 200)) == 1.0                        # cross both-sides: clamp, not 200%
 
     c = clockmod.Clock(tsc_at_anchor=0, unix_ns_at_anchor=0, cycles_per_ns=2.0)
     assert heartbeat_age_ns(cur, c, now_tsc=5000) == (5000 - 3000) / 2.0
