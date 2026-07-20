@@ -101,6 +101,17 @@ cd ..
 cat results.txt
 ```
 
+### Python monitoring layer (optional)
+The C++ engine above needs nothing from Python. The `monitoring/` package is
+stdlib-only through tier 4; only the live TUI (`rich`) and the plotting script
+(`matplotlib`) have external dependencies.
+```bash
+python3 -m pip install -r requirements.txt   # rich + matplotlib
+
+python3 -m monitoring.run_tests              # module self-tests (skips what isn't installed)
+python3 -m monitoring.tui.app                # live dashboard against a running engine
+```
+
 ### Sample Benchmark Output
 ```text
 Gateway Threads : 4
