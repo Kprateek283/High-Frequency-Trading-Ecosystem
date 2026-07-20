@@ -122,15 +122,19 @@ class Dashboard:
     # --- rendering ---
     def _health_panel(self, snap):
         t = Table(expand=True)
-        for col in ("shard", "orders/s", "fills/s", "fill%", "eng_q", "pool_free", "state"):
+        # "rested/s" not "orders/s": orders_in counts NEW reports, and an order
+        # that crosses on arrival never rests. There is no fill-ratio column
+        # because these counters cannot define one (see core/metrics.trades).
+        for col in ("shard", "rested/s", "trades/s", "trades", "eng_q", "pool_free", "state"):
             t.add_column(col, justify="right")
         rows = {r["shard"]: r for r in self.window.get("shards", [])}
         for i, sh in enumerate(snap.shards):
             w = rows.get(i, {})
             hr = metrics.pool_headroom(sh)
-            t.add_row(str(i), f"{w.get('orders_per_s', 0):,.0f}", f"{w.get('fills_per_s', 0):,.0f}",
-                      f"{metrics.fill_ratio(sh)*100:.0f}", str(sh.engine_q_depth),
-                      f"{hr*100:.0f}%", "" )
+            t.add_row(str(i), f"{w.get('orders_per_s', 0):,.0f}",
+                      f"{w.get('trades_per_s', 0):,.0f}",
+                      f"{metrics.trades(sh):,.0f}", str(sh.engine_q_depth),
+                      f"{hr*100:.0f}%", "")
         drops = (f"reports={snap.dropped_reports} drop_copies={snap.dropped_drop_copies}")
         return Panel(Group(t, f"[dim]drops:[/] {drops}"), title="Per-shard health")
 

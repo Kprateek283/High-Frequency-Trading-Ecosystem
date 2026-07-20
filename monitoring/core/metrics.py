@@ -7,33 +7,46 @@ Pure functions over snapshot objects (duck-typed: `.shards`, `.dropped_reports`,
 # ponytail: hardcoded like the C++ side; lift to config if the shard pool ever tunes.
 POOL_CAPACITY_PER_SHARD = 500000
 
+# Every match emits exactly two drop copies -- one for the aggressor, one for the
+# resting order (matching/orderbook.h, both match paths). So the `fills` counter
+# counts execution REPORTS, and the number of trades is half of it.
+REPORTS_PER_TRADE = 2
+
 
 def _per_s(cur, prev, dt):
     return (cur - prev) / dt if dt > 0 else 0.0
 
 
 def shard_rates(prev_shard, cur_shard, dt):
+    fills_per_s = _per_s(cur_shard.fills, prev_shard.fills, dt)
     return {
         "orders_per_s": _per_s(cur_shard.orders_in, prev_shard.orders_in, dt),
-        "fills_per_s": _per_s(cur_shard.fills, prev_shard.fills, dt),
+        "fills_per_s": fills_per_s,
+        "trades_per_s": fills_per_s / REPORTS_PER_TRADE,
         "cancels_per_s": _per_s(cur_shard.cancels, prev_shard.cancels, dt),
         "rejects_per_s": _per_s(cur_shard.rejects, prev_shard.rejects, dt),
     }
 
 
-def fill_ratio(shard):
-    """Fraction of this shard's order flow that filled, in [0, 1].
+def trades(shard):
+    """Matches this shard has executed.
 
-    orders_in counts NEW reports; fills counts every FILLED/PARTIAL_FILL exec
-    report — and one crossing trade emits an exec on *both* sides against a
-    single shard's orders_in, so raw fills/orders_in can exceed 1.0 (seen as
-    "fill%: 200" on a fully-filled, no-partial shard). max(orders_in, fills)
-    clamps it to <=100%.
-    ponytail: a true "orders fully filled" counter needs a C++ stats field;
-    this clamp is the honest cosmetic fix until that's worth adding.
+    There is deliberately no "fill ratio" here. The obvious fills/orders_in is
+    not a ratio of like things and cannot be made into one from these counters:
+
+      - `orders_in` counts NEW reports, and an order that crosses immediately
+        never rests, so it never emits NEW. It counts orders that RESTED.
+      - `fills` counts execution reports, two per match, plus one per partial
+        fill along the way.
+
+    Run `liquidity` and the engine records 10,000 NEW against 20,000 fills --
+    the old fills/orders_in displayed that as "fill%: 200". Clamping it to 100%
+    only hid the symptom: the number still had no definition, and a plausible
+    wrong number is worse than an obviously broken one.
+
+    Trades are exactly derivable, so that is what we report instead.
     """
-    denom = max(shard.orders_in, shard.fills)
-    return shard.fills / denom if denom else 0.0
+    return shard.fills / REPORTS_PER_TRADE
 
 
 def pool_headroom(shard, capacity=POOL_CAPACITY_PER_SHARD):
@@ -47,11 +60,11 @@ def heartbeat_age_ns(snap, clock, now_tsc):
 
 
 def summarize(prev, cur, dt):
-    """One window: per-shard rates + fill ratios + headroom, plus totals and drop deltas."""
+    """One window: per-shard rates + trade counts + headroom, plus totals and drop deltas."""
     per_shard = []
     for i, (ps, cs) in enumerate(zip(prev.shards, cur.shards)):
         row = shard_rates(ps, cs, dt)
-        row.update(shard=i, fill_ratio=fill_ratio(cs), pool_headroom=pool_headroom(cs),
+        row.update(shard=i, trades=trades(cs), pool_headroom=pool_headroom(cs),
                    engine_q_depth=cs.engine_q_depth, dropcopy_q_depth=cs.dropcopy_q_depth,
                    mktdata_q_depth=cs.mktdata_q_depth)
         per_shard.append(row)
@@ -59,6 +72,7 @@ def summarize(prev, cur, dt):
         "shards": per_shard,
         "orders_per_s": sum(r["orders_per_s"] for r in per_shard),
         "fills_per_s": sum(r["fills_per_s"] for r in per_shard),
+        "trades_per_s": sum(r["trades_per_s"] for r in per_shard),
         "dropped_reports": cur.dropped_reports,
         "dropped_drop_copies": cur.dropped_drop_copies,
         "dropped_reports_delta": cur.dropped_reports - prev.dropped_reports,
@@ -78,11 +92,15 @@ def _selftest():
     cur = NS(shards=[shard(160, 80, hw=250000, eq=3)], dropped_reports=2, dropped_drop_copies=1, heartbeat_tsc=3000)
     s = summarize(prev, cur, dt=2.0)
     assert s["orders_per_s"] == 30.0 and s["fills_per_s"] == 20.0    # (160-100)/2, (80-40)/2
-    assert abs(s["shards"][0]["fill_ratio"] - 0.5) < 1e-9            # 80/160
+    assert s["trades_per_s"] == 10.0                                 # two reports per match
     assert abs(s["shards"][0]["pool_headroom"] - 0.5) < 1e-9         # 250000/500000
     assert s["dropped_reports_delta"] == 2 and s["dropped_drop_copies_delta"] == 0
-    assert fill_ratio(shard(0, 0)) == 0.0                            # no divide-by-zero
-    assert fill_ratio(shard(100, 200)) == 1.0                        # cross both-sides: clamp, not 200%
+
+    # The liquidity workload: 10,000 orders rest, 10,000 cross them. The engine
+    # records 10,000 NEW and 20,000 execution reports. That is 10,000 trades --
+    # the case the old fills/orders_in rendered as "fill%: 200".
+    assert trades(shard(10000, 20000)) == 10000
+    assert trades(shard(0, 0)) == 0
 
     c = clockmod.Clock(tsc_at_anchor=0, unix_ns_at_anchor=0, cycles_per_ns=2.0)
     assert heartbeat_age_ns(cur, c, now_tsc=5000) == (5000 - 3000) / 2.0
