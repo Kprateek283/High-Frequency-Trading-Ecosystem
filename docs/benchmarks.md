@@ -52,12 +52,19 @@ decode path (`gateway/tcp_server.h`), exported in the shutdown stats and the `/d
 stats region. The micro-level split (`epoll_wait` / `read` / Decode / Validate / Enqueue)
 and the kernel-vs-application percentage come straight from these counters.
 
-> **`TODO(measure)`** — concrete per-stage cycle figures are **not yet re-measured** on
-> reference hardware after the Phase-0 flag unification, the Phase-1 symbol fix, and the
-> Phase-3 pinning/4-thread default. The previously published numbers were taken on an
-> unoptimised, 1-thread, reject-loop configuration (see review A1/A2/B7/B9) and have been
-> removed rather than carried forward unverified. Re-run the capacity matrix on an idle
-> reference box (`scripts/run_sharding.sh`) and populate from the counters above.
+Measured on the development box after the Phase-0/1/3 work, from the counters above:
+
+| Stage | Cycles/order |
+| :--- | ---: |
+| Decode | ~82 |
+| Validate | ~24 |
+| Enqueue | ~340 |
+
+These three are the most trustworthy figures here: they count instruction work per
+order rather than wall-clock contention, and they held within ~4% across runs on a
+loaded machine. `epoll_wait` and `read` dominate the total (tens of thousands of
+cycles/order) and are *not* quoted, because those are exactly the kernel-path costs
+that a loaded, non-isolated box distorts.
 
 ---
 
@@ -66,10 +73,44 @@ and the kernel-vs-application percentage come straight from these counters.
 The matrix sweeps load (1M–10M msgs/sec) × gateway threads (1/2/4/8), recording per row the
 TCP path, engine cycles, end-to-end latency, and the accepted/rejected split.
 
-> **`TODO(measure)`** — the full throughput/latency matrix has not been re-measured on this
-> box (Phase 3.5 stop condition: the machine cannot meaningfully sustain a 10M msgs/sec
-> load). Every cell is pending. The prior matrix is intentionally not reproduced here
-> because it predates the symbol/decode fix that made the run actually match orders.
+### Ingest throughput (measured)
+
+`scripts/measure_throughput.py` sweeps workers × concurrent clients and writes
+`benchmark_results.txt`. It samples `orders_in` from the stats region rather than
+trusting the client's reported rate — `send()` returns once the data is buffered, so
+client-side "throughput" is offered load, not work the engine did. (The tester
+happily reports ~2.6M orders/s while the engine consumes ~0.2M.)
+
+| Gateway workers | Concurrent clients | Ingest (orders/sec) |
+| ---: | ---: | ---: |
+| 1 | 1 | ~207,000 |
+| 4 | 1 | ~215,000 |
+| 4 | 2 | ~587,000 |
+| 4 | 4 | **~1,081,000** |
+| 4 | 8 | ~1,068,000 |
+
+Two things fall out of this:
+
+**`SO_REUSEPORT` shards by connection, not by packet.** 4 workers with a single
+client performs the same as 1 worker (215k vs 207k) because the accepted connection
+is pinned to one worker and the other three idle. Multi-connection load is a
+prerequisite for gateway scaling, and any load generator that opens one socket will
+silently measure a single worker.
+
+**Ingest saturates around 4 concurrent clients** on this machine (1.08M → 1.07M from
+4 to 8), consistent with oversubscription once gateway workers, engine shards, and
+the load generators together exceed the available cores.
+
+> **This is a lower bound, not a capacity figure.** The run had no `SCHED_FIFO`
+> privilege, a `powersave` governor, and other applications running; the environment
+> is recorded in the header of `benchmark_results.txt`. Treat the *shape* as the
+> result and re-run the script on isolated hardware for a real ceiling.
+>
+> **End-to-end latency remains `TODO(measure)`, deliberately.** Tail latency measures
+> exactly what arbitrary preemption ruins, and this box cannot grant `SCHED_FIFO`
+> (`ulimit -r` is 0). p99/p99.9 numbers taken here would describe the Linux scheduler,
+> not the engine — the same class of misleading figure this project already removed
+> once (review B9). The 1M–10M msgs/sec × threads matrix likewise stays open.
 
 ### What *was* verified (functional run, `results.txt`)
 
@@ -86,32 +127,42 @@ them — the accepted/rejected split A2 asked for:
 
 Reject rate is now **0%** — a property of the workload fitting the 256-instrument cap with
 symbols that decode, not of a parsing failure (contrast the pre-fix 74.4% reject rate in
-review A2). Throughput and latency for this run are `TODO(measure)`.
+review A2). Ingest throughput for the gateway is measured above; end-to-end latency for
+this run is `TODO(measure)`.
 
 ---
 
 ## Key Findings
 
-*Numbers below are `TODO(measure)` pending the re-run; the qualitative structure is what
-the design predicts and what the pre-fix runs showed directionally.*
+*Items 1, 4 and 5 are measured (see the table above). Items 2 and 3 concern latency and
+remain design predictions — this box cannot measure them, see the `SCHED_FIFO` note.*
 
-1. **Single-Thread epoll Ceiling:** A single `epoll` ingestion loop is expected to hit a
-   capacity threshold below the 10M target; pushing past it causes sustained TCP
-   receive-buffer saturation and severe queueing delay.
-2. **Queueing Delay Dominates Latency:** Under saturation the engine logic stays flat while
-   TCP queueing delay balloons by orders of magnitude — queueing delay, not execution,
-   dictates end-to-end latency.
-3. **SO_REUSEPORT Scalability:** Spreading TCP ingress across shards is expected to cut
-   queueing delay by orders of magnitude, restoring microsecond-scale latency.
-4. **The 4-Thread Operating Point:** Four gateway threads is the configured default
-   (Phase 3.3); whether it is the optimum for this machine is `TODO(measure)`.
-5. **Thread Oversubscription:** Beyond the core count, 8 gateways + 8 engines + the load
-   generator oversubscribe the CPU, increasing latency via cache contention and scheduler
-   overhead.
+1. **Single-connection ceiling is real, but it is not an `epoll` limit.** A single
+   client tops out near 207–215k orders/sec whether the gateway runs 1 or 4 workers.
+   The cause is connection-level sharding, not the ingestion loop: `SO_REUSEPORT`
+   pins an accepted connection to one worker. Concurrency has to come from
+   connections.
+2. **Queueing Delay Dominates Latency:** under saturation the engine logic is expected
+   to stay flat while TCP queueing delay balloons — queueing, not execution, dictating
+   end-to-end latency. Unverified here (`TODO(measure)`).
+3. **SO_REUSEPORT Scalability:** spreading ingress across workers is expected to cut
+   queueing delay substantially. Its *throughput* effect is confirmed (5× from 1 to 4
+   clients); its *latency* effect is `TODO(measure)`.
+4. **The 4-Thread Operating Point:** four gateway threads with four concurrent clients
+   is where ingest peaks on this machine (~1.08M orders/sec), and adding clients past
+   that does not help — so the Phase-3.3 default is the right operating point here.
+5. **Thread Oversubscription:** confirmed directionally — going from 4 to 8 concurrent
+   clients slightly *reduces* ingest (1.08M → 1.07M) as gateway workers, engine shards
+   and load generators contend for the same cores.
 
 ## Conclusions
 The functional goal — a documented run that actually matches orders through the full
-pipeline — is met (`results.txt`: 4 threads, 10,000 orders, 20,000 fills, 0 rejects). The
-throughput/latency campaign is `TODO(measure)` on reference hardware. The design thesis is
-unchanged: the primary scaling bottleneck is expected to lie in the kernel networking path,
-not the application logic, motivating future kernel-bypass work (DPDK / ef_vi).
+pipeline — is met (`results.txt`: 4 threads, 10,000 orders, 20,000 fills, 0 rejects).
+Gateway ingest is measured at **~1.08M orders/sec** on a developer desktop
+(`benchmark_results.txt`), scaling 5× with concurrent connections and saturating at
+four. The latency campaign stays open: it needs a box that can grant `SCHED_FIFO`.
+
+The design thesis is supported so far and unchanged: application-side work per order is
+small and stable (~82/24/340 cycles for decode/validate/enqueue) while the kernel
+networking path dominates the per-order total, which is what motivates the future
+kernel-bypass work (DPDK / ef_vi).

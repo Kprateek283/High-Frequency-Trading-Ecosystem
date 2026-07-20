@@ -11,15 +11,35 @@ The project models both sides of a trading venue: a Trading Firm Simulator capab
 | **Functional run** | 4-thread gateway matches orders end-to-end: 10,000 orders → 20,000 fills, **0 rejects** (`results.txt`) |
 | **Gateway Architecture** | 4-thread `SO_REUSEPORT` sharding |
 | **Latency probes** | 5-point `__rdtscp` decomposition (4 on-wire + gateway ingress) |
-| **Sustained Throughput** | `TODO(measure)` — re-run on reference hardware |
-| **End-to-End Latency** | `TODO(measure)` |
-| **Gateway Ingest Path** | `TODO(measure)` — Decode + Validate + Enqueue (this is the ingest path, *not* the matching engine, which is measured separately) |
+| **Gateway ingest** | **~1.08M orders/sec** at 4 workers × 4 concurrent clients; scales 215k → 587k → 1.08M as clients are added (`benchmark_results.txt`) |
+| **Gateway Ingest Path** | Decode **~82**, Validate **~24**, Enqueue **~340** cycles/order (ingest path only, *not* the matching engine) |
+| **End-to-End Latency** | `TODO(measure)` — needs a box where `SCHED_FIFO` is grantable; see below |
 
-> Throughput, latency, and cycle figures are pending re-measurement on an idle reference
-> box (Phase 3.5 stop condition). Earlier headline numbers were measured on an unoptimised
-> engine running a reject loop (see [`docs/review-findings.md`](./docs/review-findings.md)
-> A1/A2/B9) and were removed rather than carried forward. Cycles→time conversions use the
-> TSC frequency the engine calibrates at startup, not the spec-sheet turbo clock.
+> **Read the throughput number with its caveat.** It was measured by
+> [`scripts/measure_throughput.py`](./scripts/measure_throughput.py), which samples
+> `orders_in` from the stats region rather than trusting a client's send rate (a
+> `send()` returns once buffered, so client-side "throughput" is offered load, not
+> work done). It is a **lower bound from a developer desktop**: no `SCHED_FIFO`
+> privilege, a `powersave` governor, and other applications running. The *shape* —
+> that ingest scales with concurrent connections and saturates near 4 — is the
+> meaningful result; the ceiling will be higher on isolated hardware. Re-run the
+> script there to replace it.
+>
+> **Latency percentiles are deliberately still unmeasured.** Tail latency is
+> precisely what arbitrary preemption destroys, and this box cannot grant
+> `SCHED_FIFO` (`ulimit -r` is 0), so p99/p99.9 figures from it would be
+> measuring the scheduler, not the engine. Publishing them would repeat the
+> mistake this project already corrected once.
+>
+> Earlier headline numbers were measured on an unoptimised engine running a reject
+> loop (see [`docs/review-findings.md`](./docs/review-findings.md) A1/A2/B9) and were
+> removed rather than carried forward. Cycles→time conversions use the TSC frequency
+> the engine calibrates at startup, not the spec-sheet turbo clock.
+>
+> **Why ingest needs concurrent clients:** `SO_REUSEPORT` distributes accepted
+> *connections* across workers, so a single-socket client pins all load to one
+> worker regardless of `GATEWAY_THREADS` — measured 215k orders/s at both 1 and 4
+> workers with one client. Load generators must open multiple connections.
 
 ## 3. Architecture
 ```text
