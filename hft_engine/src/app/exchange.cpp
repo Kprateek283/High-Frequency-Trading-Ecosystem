@@ -107,8 +107,9 @@ int main() {
     // engine runs unchanged, just without observability.
     const char* shm_path = std::getenv("STATS_SHM_PATH");
     HftStatsRegion* stats = map_stats_region(shm_path ? shm_path : "/dev/shm/hft_stats");
+    AnchorBaseline anchor_baseline{};
     if (stats) {
-        init_stats_region(stats, NUM_SHARDS, timer.cycles_per_ns_value());
+        init_stats_region(stats, NUM_SHARDS, timer.cycles_per_ns_value(), &anchor_baseline);
     } else {
         std::cerr << "Warning: could not map stats region; running without it." << std::endl;
     }
@@ -164,10 +165,13 @@ int main() {
     // is the single seqlock writer of the sampled block: queue depths, pool
     // high-water, the gateway cycle attribution, and the dropped-* counters
     // mirrored out of g_stats. The per-shard order counters and heartbeat are
-    // written by the OrderManager; the anchor was written once above.
+    // written by the OrderManager. The anchor is re-published here too -- it
+    // used to be written once at startup, which let a small error in the initial
+    // TSC calibration accumulate without bound.
     while (g_running.load()) {
         if (stats) {
             stats_write(stats, [&]() {
+                refresh_anchor(stats, anchor_baseline);
                 for (int i = 0; i < NUM_SHARDS; ++i) {
                     uint64_t eng = 0;
                     for (auto& q : engine_queues[i]) eng += q->size();

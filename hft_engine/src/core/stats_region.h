@@ -33,6 +33,22 @@ struct TscAnchor {
     double   cycles_per_ns;
 };
 
+// Engine-private baseline used to refine the anchor. NOT part of the shared
+// layout -- adding a field to HftStatsRegion would require a matching change in
+// monitoring/wire.py, and this needs no reader involvement.
+struct AnchorBaseline {
+    uint64_t tsc0;                    // TSC at startup
+    uint64_t mono_ns0;                // CLOCK_MONOTONIC at startup
+    double   startup_cycles_per_ns;   // Timer::calibrate()'s 50ms estimate
+};
+
+// Refuse to refine until the baseline is long enough to beat the 50ms startup
+// sample by a wide margin.
+inline constexpr uint64_t ANCHOR_MIN_BASELINE_NS = 1000000000ULL;   // 1s
+// An invariant TSC does not change rate, so a refined estimate this far from the
+// startup one means a broken measurement, not a real drift. Keep the last good.
+inline constexpr double ANCHOR_MAX_RATE_DEVIATION = 0.20;           // +/-20%
+
 struct alignas(64) ShardStats {
     std::atomic<uint64_t> orders_in{0};
     std::atomic<uint64_t> fills{0};
@@ -78,18 +94,71 @@ inline HftStatsRegion* map_stats_region(const char* path) {
     return reinterpret_cast<HftStatsRegion*>(p);   // mmap is zero-filled
 }
 
-// Fill the write-once header + anchor. Call once, before publishing READY.
-inline void init_stats_region(HftStatsRegion* r, int num_shards, double cycles_per_ns) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    r->anchor.tsc_at_anchor = get_tsc();
+// Fill the write-once header + the initial anchor, and record the baseline the
+// refresh below refines against. Call once, before publishing READY.
+inline void init_stats_region(HftStatsRegion* r, int num_shards, double cycles_per_ns,
+                              AnchorBaseline* baseline) {
+    struct timespec real, mono;
+    clock_gettime(CLOCK_REALTIME, &real);
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    const uint64_t tsc = get_tsc();
+
+    r->anchor.tsc_at_anchor = tsc;
     r->anchor.unix_ns_at_anchor =
-        static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
+        static_cast<uint64_t>(real.tv_sec) * 1000000000ULL + real.tv_nsec;
     r->anchor.cycles_per_ns = cycles_per_ns;
+
+    if (baseline) {
+        baseline->tsc0 = tsc;
+        baseline->mono_ns0 =
+            static_cast<uint64_t>(mono.tv_sec) * 1000000000ULL + mono.tv_nsec;
+        baseline->startup_cycles_per_ns = cycles_per_ns;
+    }
+
     r->num_shards = static_cast<uint32_t>(num_shards);
     r->protocol_version = PROTOCOL_VERSION;
     r->seq.store(0, std::memory_order_relaxed);
     r->magic = HFT_STATS_MAGIC;   // published last: a reader that sees the magic sees the rest
+}
+
+// Re-anchor to "now" and refine the TSC rate. Call from the seqlock writer
+// thread only, inside stats_write.
+//
+// Timer::calibrate() estimates cycles_per_ns once from a 50ms sample. Any error
+// there is a *rate* error, so converted timestamps diverge from wall clock
+// without bound as the engine runs -- measured at ~48us per second of uptime,
+// which put the OrderManager heartbeat visibly in the future within seconds and
+// left health.assess() unable to see it (it only tests for a *stale* heartbeat).
+//
+// Two clocks on purpose:
+//   - the rate is measured against CLOCK_MONOTONIC, which never steps, so an NTP
+//     adjustment cannot corrupt it;
+//   - the epoch mapping re-reads CLOCK_REALTIME every refresh, so a step there is
+//     absorbed immediately instead of accumulating.
+// The baseline only grows, so the rate estimate keeps improving with uptime.
+inline void refresh_anchor(HftStatsRegion* r, const AnchorBaseline& base) {
+    struct timespec real, mono;
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    const uint64_t tsc_now = get_tsc();
+    clock_gettime(CLOCK_REALTIME, &real);
+
+    const uint64_t mono_ns =
+        static_cast<uint64_t>(mono.tv_sec) * 1000000000ULL + mono.tv_nsec;
+
+    r->anchor.tsc_at_anchor = tsc_now;
+    r->anchor.unix_ns_at_anchor =
+        static_cast<uint64_t>(real.tv_sec) * 1000000000ULL + real.tv_nsec;
+
+    if (mono_ns <= base.mono_ns0 || tsc_now <= base.tsc0) return;   // clock went backwards
+    const uint64_t elapsed_ns = mono_ns - base.mono_ns0;
+    if (elapsed_ns < ANCHOR_MIN_BASELINE_NS) return;                // too short to beat startup
+
+    const double rate = static_cast<double>(tsc_now - base.tsc0)
+                      / static_cast<double>(elapsed_ns);
+    const double deviation = (rate - base.startup_cycles_per_ns) / base.startup_cycles_per_ns;
+    if (deviation > -ANCHOR_MAX_RATE_DEVIATION && deviation < ANCHOR_MAX_RATE_DEVIATION) {
+        r->anchor.cycles_per_ns = rate;
+    }
 }
 
 // Seqlock write section: bump to odd, run body, bump to even. Single writer only.
