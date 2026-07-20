@@ -7,3 +7,11 @@ compile_commands.json
 .venv/
 __pycache__/
 old_notes/
+*.pid
+
+# Generated at runtime by the engine / benchmark harness
+order_audit.log
+*.resolved
+
+# Personal notes that live in the tree but must never be published
+project_assessment*

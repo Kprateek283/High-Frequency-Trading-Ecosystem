@@ -19,6 +19,9 @@ find_package(Threads REQUIRED)
 # Include Directories
 include_directories(src)
 include_directories(include)
+# The wire schema is owned by the engine and included from there — there is no
+# second copy in this project (see hft_engine/src/protocol/messages.h).
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../hft_engine/src)
 
 # Fetch simdjson
 include(FetchContent)

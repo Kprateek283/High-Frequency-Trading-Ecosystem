@@ -12,10 +12,12 @@ Standard heap allocations (`new` or `malloc`) rely on the general-purpose usersp
 ### The Implementation
 The system pre-allocates massive, contiguous byte arrays at startup. During live trading, the hot path strictly uses **Zero Dynamic Allocations**.
 
-When a new order arrives, the Gateway requests a pointer from the lock-free `MemoryPool`. It then uses `placement new` to construct the C++ `Order` object directly into that existing memory address:
+When a new order arrives, the Gateway calls the pool's variadic `allocate()`, which performs the `placement new` *itself* and returns an already-constructed `Order*` (`core/memory_pool.h`). `Order`'s constructor takes six fields (`matching/order.h`), not three:
 ```cpp
-Order* order = new (pool.allocate()) Order(price, quantity, side);
+Order* o = pool.allocate(internal_id, order_token, client_id, price, shares, inst, side);
 ```
+The allocate fast path is guarded by a spinlock (`alloc_lock`), not lock-free: multiple gateway workers can allocate from the same shard pool concurrently, so the high-water bump must be serialised. The engine's `deallocate()` stays lock-free.
+
 **Impact:** Order creation avoids general-purpose heap allocation and reduces allocation overhead to a bounded constant-time operation.
 
 ---
@@ -44,19 +46,21 @@ if (head.load(std::memory_order_acquire) < tail_local) { ... }
 
 ---
 
-## 3. False-Sharing Mitigation (`alignas(64)`)
+## 3. False-Sharing Mitigation (`alignas(128)`)
 
 ### The Problem
 Modern CPU caches operate in 64-byte chunks called "Cache Lines". In the SPSC queue, the Gateway thread constantly writes to `tail`, and the Matching Engine constantly writes to `head`. 
-If `head` and `tail` happen to sit next to each other in memory (within the same 64 bytes), the physical CPU hardware will detect a collision. Every time the Gateway updates `tail`, the CPU will invalidate the Matching Engine's cache line containing `head`, forcing a slow fetch from main memory. This hardware-level thrashing is known as **False Sharing**.
+If `head` and `tail` share a cache line, every `tail` update invalidates the consumer's line containing `head`, forcing a slow fetch from main memory. This hardware-level thrashing is known as **False Sharing**.
 
 ### The Implementation
-We force the compiler to physically separate the atomic pointers into distinct cache lines using the `alignas` specifier:
+We separate the members with `alignas(128)`, not 64 (`core/lock_free_queue.h`):
 ```cpp
-alignas(64) std::atomic<size_t> head{0};
-alignas(64) std::atomic<size_t> tail{0};
+alignas(128) std::atomic<size_t> head;
+alignas(128) std::atomic<size_t> tail;
 ```
-**Impact:** The Gateway and Matching Engine operate on entirely separate physical cache lines, allowing both cores to run at maximum silicon speed without invalidating each other's L1 cache.
+128, not 64, is deliberate: Intel's L2 **spatial prefetcher** pulls in 128-byte-aligned pairs of cache lines, so 64-byte separation still lets the two lines be prefetched together and false-share on this CPU family. 128-byte alignment defeats that pairing.
+
+**Impact:** The Gateway and Matching Engine operate on entirely separate physical cache-line pairs, allowing both cores to run at maximum silicon speed without invalidating each other's cache.
 
 ---
 
@@ -66,15 +70,16 @@ alignas(64) std::atomic<size_t> tail{0};
 Traditional networking applications read bytes into a buffer, deserialize them, and copy the data into application-level structs. Copying memory is expensive, and branching logic to parse fields destroys CPU branch prediction.
 
 ### The Implementation
-The Trading Simulator sends binary OUCH payloads. Because both the client and server use the same struct packing, the Gateway avoids deserialization entirely.
+The Trading Simulator sends binary OUCH payloads. Because both the client and server use the same struct packing, the Gateway avoids field-by-field deserialization: it `memcpy`s the bytes into a properly-aligned `OuchEnterOrder` and reads fields directly (`gateway/tcp_server.h`).
 ```cpp
 // Read directly from the kernel into userspace
-int bytes = read(fd, buffer, sizeof(buffer));
+ssize_t n = read(fd, buffer, sizeof(buffer));
 
-// Zero-copy reinterpret
-const OuchOrderMessage* msg = reinterpret_cast<const OuchOrderMessage*>(buffer);
+// memcpy into a correctly-aligned struct (NOT a reinterpret_cast).
+OuchEnterOrder req;
+std::memcpy(&req, buffer + read_pos, sizeof(OuchEnterOrder));
 ```
-**Impact:** The parsing phase is reduced to direct field access over an existing memory buffer, eliminating intermediate object construction and memory copies. Data is accessed directly from the receive buffer rather than being copied into temporary parsing structures. This approach assumes identical struct layout, packing, and endianness between producer and consumer.
+**Impact:** The parse is a single 81-byte `memcpy` into an aligned struct, then direct field access — no per-field deserialization. We `memcpy` rather than `reinterpret_cast<OuchEnterOrder*>(buffer)` on purpose: casting a `char*` into a packed-struct pointer is a strict-aliasing and alignment violation (UB), while the compiler routinely elides the `memcpy` into the same loads a cast would emit. This assumes identical struct layout, packing, and endianness between producer and consumer.
 
 ---
 
@@ -97,6 +102,8 @@ while (true) {
 }
 ```
 **Impact:** By combining `EPOLLET` with non-blocking sockets (`O_NONBLOCK`), the Gateway guarantees it drains every single byte from the kernel buffer in one userspace trip, minimizing the number of expensive `epoll_wait` syscalls.
+
+> Note: edge-triggered applies to the **client** fds only. The **listen** fd is registered plain level-triggered (`EPOLLIN`, `gateway/tcp_server.h`) on purpose — a level-triggered listener with a single `accept()` per wakeup is correct and simpler than the ET equivalent, which would require an `accept()` drain loop. This is intentional, not an inconsistency.
 
 ---
 
@@ -123,27 +130,18 @@ Multiple Gateway threads bind to the exact same IP and Port. The Linux kernel us
 Standard timing APIs (`std::chrono::high_resolution_clock`, `clock_gettime()`) invoke the vDSO or the kernel, introducing measurable observer overhead relative to the sub-microsecond events they are trying to measure. 
 
 ### The Implementation
-The system bypasses software abstractions entirely and reads the CPU's internal Time Stamp Counter (TSC) using hardware intrinsics. The `__rdtscp` instruction provides the current cycle count, while `_mm_lfence()` (Load Fence) ensures the CPU does not execute the measurement instruction out-of-order via speculation.
+The system bypasses software abstractions entirely and reads the CPU's internal Time Stamp Counter (TSC) using hardware intrinsics. It uses `__rdtscp` (not `__rdtsc`) because `__rdtscp` waits for prior instructions to retire before reading the counter — it already serialises against prior loads, so no separate `_mm_lfence()` is needed (`core/timer.h`):
 
 ```cpp
-inline uint64_t get_cycles() {
-    uint32_t aux;
-    _mm_lfence();
-    return __rdtscp(&aux);
+inline uint64_t get_tsc() {
+    unsigned int dummy;
+    return __rdtscp(&dummy);
 }
 ```
-This timestamp is injected directly into the payload of the simulated packet at creation (T0), captured at Gateway ingress (T1), and captured at Matching Engine egress (T2).
+Four such timestamps ride on the wire in `OuchEnterOrder` (`t1_exchange_send` … `t4_network_deq`); the Gateway captures a fifth (`t5`) at ingress the moment `read()` returns. The Matching Engine separately pairs a per-task `ingress_tsc` with a `get_tsc()` at match completion — a five-point wire decomposition plus the engine's own execution measurement (see [`telemetry.md`](./telemetry.md)).
 
-**Impact:** This enables low-overhead, cycle-accurate latency decomposition across the ecosystem, definitively proving that the Linux network stack (and not the C++ application) was the primary latency bottleneck.
+**Impact:** This enables low-overhead, cycle-accurate latency decomposition across the ecosystem.
 
 ### Example Attribution
 
-| Stage | Cycles |
-|---------|---------:|
-| `epoll_wait()` | 1157 |
-| `read()` | 124 |
-| Decode | 82 |
-| Validation | 27 |
-| Enqueue | 258 |
-
-This attribution showed that approximately 77% of ingress cost originated in the Linux networking stack, while the application logic accounted for roughly 23%.
+The gateway maintains per-stage cycle accumulators (`total_read_cycles`, `total_decode_cycles`, `total_validation_cycles`, `total_enqueue_cycles`) exported in the shutdown stats and the `/dev/shm` region. Concrete per-stage figures are **`TODO(measure)`** — the capacity matrix has not been re-run on reference hardware since the Phase-0/1/3 fixes (see [`benchmarks.md`](./benchmarks.md)); the earlier hardcoded numbers were removed rather than carried forward unverified.

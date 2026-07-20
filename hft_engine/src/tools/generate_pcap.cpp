@@ -17,7 +17,11 @@ int main(int argc, char** argv) {
     }
 
     const int TOTAL_ORDERS = 5000000; // 5 Million orders
-    const char* stocks[4] = {"AAPL    ", "MSFT    ", "GOOG    ", "AMZN    "};
+    // Four instruments in the canonical STK##### encoding. These used to be
+    // "AAPL    ", "MSFT    ", "GOOG    ", "AMZN    ", which the gateway decoded
+    // to no instrument at all — every order in the generated file was rejected
+    // (review A1), which is what made this file useless as a replay input.
+    const uint16_t stocks[4] = {0, 1, 2, 3};
 
     std::cout << "Generating " << TOTAL_ORDERS << " binary OUCH orders...\n";
 
@@ -32,7 +36,7 @@ int main(int argc, char** argv) {
         // Randomize side and stock properly so they match
         req.side = (rand() % 2 == 0) ? 'B' : 'S';
         req.shares = 100;
-        std::memcpy(req.stock, stocks[rand() % 4], 8);
+        encode_symbol(req.stock, stocks[rand() % 4]);
         
         // Tight spread around 50000
         req.price = 50000 + (rand() % 10);

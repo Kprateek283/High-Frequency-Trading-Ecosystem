@@ -8,7 +8,14 @@
 #include "core/lock_free_queue.h"
 
 const uint32_t MAX_PRICE = 100001;
-const uint32_t MAX_ORDERS_LOOKUP = 20000001; 
+
+// Live orders per shard are bounded by the shard's memory pool, and each order's
+// internal_id IS its pool slot index. So orders_by_id only needs pool-capacity
+// entries (indexed [1, POOL_CAPACITY_PER_SHARD); slot 0 is the reserved null
+// handle). This is the single source of truth shared with the pool allocation in
+// exchange.cpp, and it means internal_ids recycle with pool slots and never exhaust.
+const uint32_t POOL_CAPACITY_PER_SHARD = 500000;
+const uint32_t MAX_ORDERS_LOOKUP = POOL_CAPACITY_PER_SHARD;
 
 class OrderBook {
 private:
@@ -66,19 +73,29 @@ private:
         }
     }
 
+    // Finds the lowest set ask price >= start_price, or -1 if none.
     inline int32_t find_next_ask(uint32_t start_price) {
+        const uint32_t num_l2 = MAX_PRICE / 4096 + 1;
         uint32_t word_idx = start_price >> 6;
+
+        // 1. Remainder of the starting L1 word (bits at/above start_price).
         uint64_t word = asks_bitmap[word_idx] & (~0ULL << (start_price & 63));
         if (word) return (word_idx << 6) + __builtin_ctzll(word);
 
+        // 2. Following L1 words within the current L2 group. Mask keeps bits
+        //    strictly above (word_idx & 63); guarded against shift-by-64 UB and
+        //    against wrongly re-selecting the current word at the group boundary.
         uint32_t l2_word_idx = word_idx >> 6;
-        uint64_t l2_word = asks_l2[l2_word_idx] & (~0ULL << ((word_idx + 1) & 63));
+        uint32_t bit_in_l2 = word_idx & 63;
+        uint64_t l2_mask = (bit_in_l2 == 63) ? 0ULL : (~0ULL << (bit_in_l2 + 1));
+        uint64_t l2_word = asks_l2[l2_word_idx] & l2_mask;
         if (l2_word) {
             uint32_t next_word_idx = (l2_word_idx << 6) + __builtin_ctzll(l2_word);
             return (next_word_idx << 6) + __builtin_ctzll(asks_bitmap[next_word_idx]);
         }
 
-        for (uint32_t i = l2_word_idx + 1; i < (MAX_PRICE / 4096 + 1); ++i) {
+        // 3. Following L2 groups.
+        for (uint32_t i = l2_word_idx + 1; i < num_l2; ++i) {
             if (asks_l2[i]) {
                 uint32_t next_word_idx = (i << 6) + __builtin_ctzll(asks_l2[i]);
                 return (next_word_idx << 6) + __builtin_ctzll(asks_bitmap[next_word_idx]);
@@ -87,18 +104,27 @@ private:
         return -1;
     }
 
+    // Finds the highest set bid price <= start_price, or -1 if none.
     inline int32_t find_next_bid(uint32_t start_price) {
         int32_t word_idx = (int32_t)(start_price >> 6);
+
+        // 1. Remainder of the starting L1 word (bits at/below start_price).
         uint64_t word = bids_bitmap[word_idx] & (~0ULL >> (63 - (start_price & 63)));
         if (word) return (word_idx << 6) + (63 - __builtin_clzll(word));
 
+        // 2. Preceding L1 words within the current L2 group. Mask keeps bits
+        //    strictly below (word_idx & 63); guarded against shift-by-64 UB and
+        //    against wrongly re-selecting the current word at the group boundary.
         int32_t l2_word_idx = word_idx >> 6;
-        uint64_t l2_word = bids_l2[l2_word_idx] & (~0ULL >> (63 - ((word_idx - 1) & 63)));
+        uint32_t bit_in_l2 = (uint32_t)word_idx & 63;
+        uint64_t l2_mask = (bit_in_l2 == 0) ? 0ULL : (~0ULL >> (64 - bit_in_l2));
+        uint64_t l2_word = bids_l2[l2_word_idx] & l2_mask;
         if (l2_word) {
             uint32_t next_word_idx = (l2_word_idx << 6) + (63 - __builtin_clzll(l2_word));
             return (next_word_idx << 6) + (63 - __builtin_clzll(bids_bitmap[next_word_idx]));
         }
 
+        // 3. Preceding L2 groups.
         for (int32_t i = l2_word_idx - 1; i >= 0; --i) {
             if (bids_l2[i]) {
                 uint32_t next_word_idx = (i << 6) + (63 - __builtin_clzll(bids_l2[i]));
@@ -113,7 +139,9 @@ private:
     LockFreeQueue<DropCopyMessage, 1048576>* drop_copy_queue = nullptr;
 
     inline void broadcast(char type, uint64_t internal_id, uint64_t price, uint32_t qty, uint16_t inst, char side) {
-        ItchMessage report = {type, inst, 0, __builtin_ia32_rdtsc(), internal_id, qty, price, side};
+        // timestamp is (re)stamped at send time by the Publisher (that send time is
+        // what consumers use as t1_exchange_send), so don't waste an rdtsc here.
+        ItchMessage report = {type, inst, 0, 0, internal_id, qty, price, side};
         if (!mkt_data_queue->push(report)) {
             g_stats.dropped_reports.fetch_add(1, std::memory_order_relaxed);
         }
@@ -121,8 +149,22 @@ private:
 
     inline void send_drop_copy(uint64_t client_id, uint64_t internal_id, uint64_t price, uint32_t qty, uint16_t inst, Side side, OrderState state) {
         DropCopyMessage msg = {client_id, internal_id, price, qty, inst, state, side};
-        // Don't spin, drop copy queue is huge and read asynchronously.
-        drop_copy_queue->push(msg);
+        // Don't spin, drop copy queue is huge and read asynchronously. If it does
+        // fill, count the loss (mirrors broadcast's dropped_reports) so the audit
+        // gap is visible instead of silent.
+        if (!drop_copy_queue->push(msg)) {
+            g_stats.dropped_drop_copies.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // Self-trade prevention (cancel-newest): the incoming order would execute
+    // against a resting order from the same client, so reject the incoming
+    // order's remainder instead of crossing. No book surgery — the resting
+    // side is untouched.
+    inline void reject_self_trade(Order* o) {
+        send_drop_copy(o->client_order_id, o->internal_id, o->price, o->quantity,
+                       o->instrument_id, o->side, OrderState::REJECTED);
+        pool->deallocate(o);
     }
 
 public:
@@ -191,16 +233,20 @@ public:
                 Limit& level = asks[p];
                 while (new_order->quantity > 0 && level.head) {
                     Order* resting = level.head;
+                    if (resting->client_id == new_order->client_id) [[unlikely]] {
+                        reject_self_trade(new_order);
+                        return;
+                    }
                     if (resting->next) [[likely]] {
                         __builtin_prefetch(resting->next, 0, 3);
                     }
                     uint32_t match_qty = std::min(new_order->quantity, resting->quantity);
                     broadcast('E', resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side == Side::BUY ? 'B' : 'S');
                     broadcast('E', new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side == Side::BUY ? 'B' : 'S');
-                    
-                    send_drop_copy(new_order->client_order_id, new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side, 
+
+                    send_drop_copy(new_order->client_order_id, new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side,
                                    new_order->quantity > resting->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
-                    send_drop_copy(resting->client_order_id, resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side, 
+                    send_drop_copy(resting->client_order_id, resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side,
                                    resting->quantity > new_order->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
 
                     if (new_order->quantity >= resting->quantity) [[likely]] {
@@ -241,16 +287,20 @@ public:
                 Limit& level = bids[p];
                 while (new_order->quantity > 0 && level.head) {
                     Order* resting = level.head;
+                    if (resting->client_id == new_order->client_id) [[unlikely]] {
+                        reject_self_trade(new_order);
+                        return;
+                    }
                     if (resting->next) [[likely]] {
                         __builtin_prefetch(resting->next, 0, 3);
                     }
                     uint32_t match_qty = std::min(new_order->quantity, resting->quantity);
                     broadcast('E', resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side == Side::BUY ? 'B' : 'S');
                     broadcast('E', new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side == Side::BUY ? 'B' : 'S');
-                    
-                    send_drop_copy(new_order->client_order_id, new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side, 
+
+                    send_drop_copy(new_order->client_order_id, new_order->internal_id, resting->price, match_qty, new_order->instrument_id, new_order->side,
                                    new_order->quantity > resting->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
-                    send_drop_copy(resting->client_order_id, resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side, 
+                    send_drop_copy(resting->client_order_id, resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side,
                                    resting->quantity > new_order->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
 
                     if (new_order->quantity >= resting->quantity) [[likely]] {

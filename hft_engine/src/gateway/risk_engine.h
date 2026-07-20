@@ -16,7 +16,9 @@ public:
         if (req.shares == 0 || req.shares > max_order_qty) return false;
         if (req.price == 0 || req.price > max_price) return false;
         if (static_cast<uint64_t>(req.price) * req.shares > max_notional) return false;
-        if (mapped_inst >= 256) return false; // MAX_INSTRUMENTS
+        // One definition of instrument validity, from the protocol header. This
+        // also rejects INVALID_INSTRUMENT, which is deliberately out of range.
+        if (mapped_inst >= MAX_INSTRUMENTS) return false;
         return true;
     }
 };
