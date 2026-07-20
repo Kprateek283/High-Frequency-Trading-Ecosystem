@@ -6,9 +6,11 @@ Four panels, each fed by one lower tier:
   tape     ← feeds/audit_reader                            (recent fills/cancels)
   book     ← feeds/multicast + core/orderbook              (top of book)
   liveness ← stats-region heartbeat age
-The readers are all non-blocking per frame (multicast gets a short socket
-timeout) so the render loop never stalls waiting on a feed.
+The stats and audit readers are cheap and polled per frame. Market data is not:
+it arrives in bursts far faster than the render rate, so it gets its own reader
+thread (see _BookFeed) instead of being drained from the render loop.
 """
+import threading
 import time
 from collections import deque
 
@@ -27,13 +29,61 @@ from ..core.orderbook import BookSet
 from .. import wire, health
 
 
+class _BookFeed:
+    """Drains the ITCH socket on its own thread and keeps the books current.
+
+    The render loop cannot do this job. It stops reading whenever it draws a
+    frame or sleeps between frames, and market data arrives in bursts (a full
+    cross is ~30k messages in under a second) that overflow the socket in that
+    gap. One datagram carries one message and the wire has no sequence numbers,
+    so the loss is silent: the reconstructed book simply drifts from the
+    engine's (measured: thousands of phantom resting orders on a flat book).
+    Reading continuously on a dedicated thread is what actually keeps up; the
+    UI borrows a consistent view through `top_of_book`.
+    """
+
+    def __init__(self, mcast):
+        self.mcast = mcast
+        self.books = BookSet()
+        self.applied = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="itch-reader", daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                for m in self.mcast.poll():
+                    with self._lock:
+                        self.books.apply(m)
+                        self.applied += 1
+            except OSError:
+                continue          # nothing available this instant — keep reading
+
+    def top_of_book(self, limit=10):
+        """Snapshot of the first `limit` instruments, taken under the lock."""
+        with self._lock:
+            insts = sorted(self.books.books)[:limit]
+            return [(i, self.books.books[i].best_bid(), self.books.books[i].best_ask())
+                    for i in insts]
+
+    def stop(self):
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+
 class Dashboard:
     def __init__(self, cfg=None, tape_size=12):
         self.cfg = cfg or Config()
         self.stats = None
         self.audit = None
         self.mcast = None
-        self.books = BookSet()
+        self.feed = None          # _BookFeed once open_feeds() runs
+        self.books = BookSet()    # used only when there is no live feed (tests)
         self.tape = deque(maxlen=tape_size)
         self.prev_snap = None
         self.prev_t = None
@@ -51,6 +101,7 @@ class Dashboard:
             self.audit = None
         try:
             self.mcast = MulticastReader.from_config(self.cfg, timeout=0.05)
+            self.feed = _BookFeed(self.mcast).start()
         except OSError:
             self.mcast = None
 
@@ -65,13 +116,7 @@ class Dashboard:
         if self.audit:
             for e in self.audit.poll():
                 self.tape.appendleft(e)
-        if self.mcast:
-            for _ in range(64):                 # drain what's queued, then move on
-                try:
-                    for m in self.mcast.poll():
-                        self.books.apply(m)
-                except OSError:
-                    break                       # timeout / would-block
+        # Market data is not polled here — _BookFeed's thread owns that socket.
         return snap
 
     # --- rendering ---
@@ -99,13 +144,19 @@ class Dashboard:
                       str(e.client_order_id))
         return Panel(t, title="Trade tape (audit)")
 
+    def _top_of_book(self, limit=10):
+        if self.feed:
+            return self.feed.top_of_book(limit)
+        insts = sorted(self.books.books)[:limit]          # no live feed (tests)
+        return [(i, self.books.books[i].best_bid(), self.books.books[i].best_ask())
+                for i in insts]
+
     def _book_panel(self):
         t = Table(expand=True)
         for col in ("inst", "best_bid", "best_ask"):
             t.add_column(col, justify="right")
-        for inst in sorted(self.books.books)[:10]:
-            b = self.books.books[inst]
-            t.add_row(str(inst), str(b.best_bid()), str(b.best_ask()))
+        for inst, bid, ask in self._top_of_book():
+            t.add_row(str(inst), str(bid), str(ask))
         return Panel(t, title="Top of book (ITCH)")
 
     def _liveness_line(self, snap):
@@ -141,6 +192,8 @@ class Dashboard:
                 live.update(self.frame())
 
     def close(self):
+        if self.feed:
+            self.feed.stop()          # stop reading before the socket goes away
         for r in (self.stats, self.audit, self.mcast):
             if r:
                 r.close()
@@ -177,9 +230,49 @@ def _fake_entry():
     return e
 
 
+def _feed_keeps_up_with_a_burst():
+    """Regression: the book feed must absorb a burst far larger than one frame's
+    worth. Draining from the render loop capped this at 64/frame and dropped the
+    rest on the floor, silently desyncing the book."""
+    n = 20000                                  # burst, delivered as fast as it can
+    pending = [wire.ItchMessage("A", 0, 0, 0, ref, 10, 50000 + ref, "B")
+               for ref in range(1, n + 1)]
+
+    class BurstMcast:                          # one message per poll, then "empty"
+        def poll(self):
+            if not pending:
+                raise BlockingIOError          # an OSError: nothing right now
+            yield pending.pop(0)
+
+    feed = _BookFeed(BurstMcast()).start()
+    deadline = time.monotonic() + 10.0
+    while feed.applied < n and time.monotonic() < deadline:
+        feed.top_of_book()                     # hammer the lock like a render loop
+        time.sleep(0.01)
+    feed.stop()
+    assert feed.applied == n, f"only {feed.applied}/{n} messages applied"
+    assert len(feed.books.books[0].orders) == n
+    return True
+
+
+def _feed_stops_cleanly():
+    """stop() must terminate the reader thread even on a feed that never idles."""
+    class EndlessMcast:
+        def poll(self):
+            yield wire.ItchMessage("A", 0, 0, 0, 1, 10, 50000, "B")
+
+    feed = _BookFeed(EndlessMcast()).start()
+    time.sleep(0.05)
+    feed.stop()
+    assert not feed._thread.is_alive(), "reader thread outlived stop()"
+    return True
+
+
 def _selftest():
     assert _render_once_headless()
-    print("tui: OK (headless render)")
+    assert _feed_keeps_up_with_a_burst()
+    assert _feed_stops_cleanly()
+    print("tui: OK (headless render, burst-proof feed, clean stop)")
 
 
 if __name__ == "__main__":
