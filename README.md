@@ -71,7 +71,8 @@ For detailed architecture, see: [docs/architecture.md](./docs/architecture.md)
 We treat documentation as a first-class citizen. Detailed technical deep-dives are available in the `docs/` directory:
 
 *   [**Architecture (`docs/architecture.md`)**](./docs/architecture.md): The dual-sided nature of the ecosystem, Thread-Per-Shard gateway, and Order Book design.
-*   [**Benchmarks & Capacity (`docs/benchmarks.md`)**](./docs/benchmarks.md): Telemetry proving the 10M msgs/sec scaling and Gateway CPU cycle attribution.
+*   [**Benchmarks & Capacity (`docs/benchmarks.md`)**](./docs/benchmarks.md): The 5-point latency decomposition, gateway CPU cycle attribution, the measured ingest sweep, and what is still `TODO(measure)` pending reference hardware.
+*   [**Benchmark Setup (`docs/benchmark-setup.md`)**](./docs/benchmark-setup.md): The three OS prerequisites (`SCHED_FIFO`, `performance` governor, `isolcpus`) that turn the lower-bound numbers into publishable ones — no code changes, environment only.
 *   [**Technical Deep Dive (`docs/technical-deep-dive.md`)**](./docs/technical-deep-dive.md): Lock-Free SPSC Queues, false-sharing mitigation, Memory Pools, and atomic memory barriers.
 *   [**Engineering Bottlenecks (`docs/bottlenecks.md`)**](./docs/bottlenecks.md): Challenges faced, including the TCP queueing-delay saturation, the EBADF epoll spin-loop, and the SIGBUS on the mmap'd audit log.
 *   [**Telemetry Pipeline (`docs/telemetry.md`)**](./docs/telemetry.md): Using x86 hardware intrinsics to bypass `clock_gettime` overhead.
@@ -86,6 +87,7 @@ Trading-Ecosystem/
 ├── docs/                   # Detailed technical documentation
 │   ├── architecture.md
 │   ├── benchmarks.md
+│   ├── benchmark-setup.md           # SCHED_FIFO / governor / isolcpus prerequisites
 │   ├── bottlenecks.md
 │   ├── technical-deep-dive.md
 │   ├── telemetry.md
@@ -159,6 +161,27 @@ FILLED        : 20000
 > Throughput/latency numbers are pending re-measurement on reference hardware
 > (`TODO(measure)`); the run above verifies the pipeline end-to-end and that
 > matches are produced.
+
+### Measuring latency & the capacity matrix
+The harness is complete and needs no code changes — only a box configured for
+deterministic execution. Set the three OS prerequisites once
+([`docs/benchmark-setup.md`](./docs/benchmark-setup.md)):
+
+1. **`SCHED_FIFO`** — `ulimit -r unlimited` (else real-time pinning silently degrades).
+2. **`performance` governor** — `sudo cpupower frequency-set -g performance`.
+3. **`isolcpus`** — isolate the engine's cores (1–8, per `config.env`) via GRUB + reboot.
+
+Then produce the full matrix with two commands:
+```bash
+# Latency percentiles + cycle attribution + accepted/rejected, per shard count
+for gt in 1 2 4 8; do GATEWAY_THREADS=$gt ./scripts/run_sharding.sh; done   # -> results.txt
+
+# Ingest throughput sweep (gateway workers x concurrent clients)
+python3 scripts/measure_throughput.py                                       # -> benchmark_results.txt
+```
+Both files stamp the environment (`governor`, `rtprio_limit`, `isolcpus`) in their
+header, so a lower-bound run is always distinguishable from a publishable one. On this
+development laptop the numbers are a lower bound; see `docs/benchmarks.md`.
 
 ## 7. Future Work
 1. **Kernel Bypass:** Implement Intel DPDK or Solarflare `ef_vi` to map the NIC directly to userspace memory.
