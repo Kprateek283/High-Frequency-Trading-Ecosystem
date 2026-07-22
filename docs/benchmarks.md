@@ -132,7 +132,9 @@ python3 scripts/measure_throughput.py                                       # ->
 
 On a box that grants `SCHED_FIFO` (`ulimit -r unlimited`), pins to isolated cores
 (`isolcpus=`), and uses the `performance` governor, these same two commands turn the
-lower bounds above into the publishable matrix. No code change required.
+lower bounds above into the publishable matrix. No code change required — the exact
+setup steps and how to verify each are in
+[`benchmark-setup.md`](./benchmark-setup.md).
 
 ### What *was* verified (functional run, `results.txt`)
 
