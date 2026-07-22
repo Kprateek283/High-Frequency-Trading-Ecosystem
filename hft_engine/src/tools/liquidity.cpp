@@ -22,7 +22,19 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <x86intrin.h>
 #include "protocol/messages.h"
+
+// Stamp the wire timestamps right before send so the gateway records latency
+// samples (it skips any order with a zero timestamp). liquidity has no firm-side
+// pipeline, so all four carry one send-time TSC: the intra-firm stages (t2-t1,
+// t3-t2, t4-t3) read ~0 by design, while the TCP path (t5-t4) and end-to-end
+// (t5-t1) are the real, meaningful numbers. Firm-pipeline latency is trading_firm.
+static inline void stamp(OuchEnterOrder& o) {
+    unsigned aux;
+    uint64_t ts = __rdtscp(&aux);
+    o.t1_exchange_send = o.t2_trading_recv = o.t3_trading_enq = o.t4_network_deq = ts;
+}
 
 static int connect_gateway(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -78,6 +90,7 @@ int main() {
     // but it makes the resting side deterministic).
     for (int i = 0; i < n; ++i) {
         OuchEnterOrder a = make_order(1 + i, 'S', sym, price, 10);
+        stamp(a);
         if (send(rester, &a, sizeof(a), 0) != (ssize_t)sizeof(a)) break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -85,6 +98,7 @@ int main() {
     // B: cross every one of them.
     for (int i = 0; i < n; ++i) {
         OuchEnterOrder b = make_order(10000000 + i, 'B', sym, price, 10);
+        stamp(b);
         if (send(crosser, &b, sizeof(b), 0) != (ssize_t)sizeof(b)) break;
     }
 
