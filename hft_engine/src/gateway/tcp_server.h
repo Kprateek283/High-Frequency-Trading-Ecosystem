@@ -145,6 +145,18 @@ public:
     std::atomic<uint64_t> total_enqueue_cycles{0};
     std::atomic<uint64_t> total_orders_processed{0};
 
+    // End-to-end/TCP latency percentiles (the averages above hide the tail the
+    // whole queueing-delay story is about). Reuses Timer, which already sorts a
+    // reservoir into P50/P99/P99.9 and converts cycles->ns via its calibrated
+    // cycles_per_ns. Gated by LATENCY_PROFILE so the throughput sweep
+    // (measure_throughput.py) isn't charged for the reservoir writes; the
+    // functional run (run_sharding.sh) sets it.
+    // ponytail: shared reservoir => one atomic counter across workers. Fine for a
+    // profiling run; go per-worker Timers if it ever bounds throughput.
+    Timer e2e_timer{1000000};   // t1_exchange_send -> t5 (gateway ingress)
+    Timer tcp_timer{1000000};   // t4_network_deq  -> t5 (kernel TCP path)
+    bool profile_latency = std::getenv("LATENCY_PROFILE") != nullptr;
+
     void print_experiment_4_stats() {
         uint64_t n = num_samples.load();
         if (n > 0) {
@@ -172,8 +184,16 @@ public:
             std::cout << "Validation   : " << (total_validation_cycles.load() / orders) << " cycles/order\n";
             std::cout << "Enqueue      : " << (total_enqueue_cycles.load() / orders) << " cycles/order\n";
             std::cout << "Total/Order  : " << ((total_epoll_cycles.load() + total_read_cycles.load() + total_decode_cycles.load() + total_validation_cycles.load() + total_enqueue_cycles.load()) / orders) << " cycles/order\n";
+            std::cout << "Calibrated TSC: " << e2e_timer.cycles_per_ns_value() << " cycles/ns\n";
             std::cout << "========================================\n";
         }
+
+        // Percentiles for the two stages whose tail carries the queueing-delay
+        // story (averages above can't show it). No-ops unless LATENCY_PROFILE was
+        // set — printStats returns early on an empty reservoir.
+        std::cout.flush();
+        e2e_timer.printStats("Gateway End-to-End Latency (t1->t5)");
+        tcp_timer.printStats("Gateway TCP Path Latency (t4->t5)");
     }
 
     void worker_loop(int thread_id, std::atomic<bool>& running) {
@@ -314,6 +334,10 @@ public:
                             total_tcp += (t5 - req.t4_network_deq);
                             total_e2e += (t5 - req.t1_exchange_send);
                             num_samples++;
+                            if (profile_latency) {
+                                e2e_timer.add_latency(t5 - req.t1_exchange_send);
+                                tcp_timer.add_latency(t5 - req.t4_network_deq);
+                            }
                         }
                         
                         // The token identifies the order; the connection

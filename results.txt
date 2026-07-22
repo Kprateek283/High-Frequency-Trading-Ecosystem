@@ -1,4 +1,4 @@
-# HFT ecosystem run  2026-07-20T19:21:35Z
+# HFT ecosystem run  2026-07-22T18:14:15Z
 Gateway Threads : 4
 entries       : 30000
 NEW           : 10000
@@ -7,7 +7,76 @@ FILLED        : 20000
 PARTIAL_FILL  : 0
 CANCELED      : 0
 REJECTED      : 0
-# Gateway ingest throughput: see benchmark_results.txt
-#   (regenerate with scripts/measure_throughput.py).
-# TODO(measure): end-to-end latency percentiles still need a box that can
-#   grant SCHED_FIFO; see docs/benchmarks.md.
+
+# ---- Cycle attribution + latency percentiles (this run) ----
+[Metrics] Real-Time 1s Window:
+  Orders/sec: 10000
+  Trades/sec: 20000
+  Reject Rate: 0%
+
+--- Latency (Last Window) ---
+Orders in Window: 20000
+Avg Latency:      907.901 ns (1916.42 cycles)
+P50 (Median):     315.517 ns (666 cycles)
+P99:              5118.39 ns (10804 cycles)
+P99.9:            166126 ns (350662 cycles)
+P99.99:           241709 ns (510204 cycles)
+Max:              1.06518e+06 ns (2248398 cycles)
+
+Shutdown signal received. Joining threads...
+
+========================================
+ EXPERIMENT 4: Latency Decomposition 
+========================================
+Samples       : 20000
+UDP Path      : 0 cycles
+Trading Engine: 0 cycles
+SPSC Queue    : 0 cycles
+TCP Path      : 205279 cycles
+----------------------------------------
+End-to-End    : 205279 cycles
+========================================
+
+========================================
+ Exchange Gateway Attribution (Average) 
+========================================
+epoll_wait() : 28596 cycles/order
+read()       : 5031 cycles/order
+Decode       : 209 cycles/order
+Validation   : 28 cycles/order
+Enqueue      : 351 cycles/order
+Total/Order  : 34217 cycles/order
+Calibrated TSC: 2.11083 cycles/ns
+========================================
+
+--- Gateway End-to-End Latency (t1->t5) ---
+Orders in Window: 20000
+Avg Latency:      97250.6 ns (205279 cycles)
+P50 (Median):     8842.97 ns (18666 cycles)
+P99:              1.01491e+06 ns (2142291 cycles)
+P99.9:            1.04841e+06 ns (2213012 cycles)
+P99.99:           1.0593e+06 ns (2236006 cycles)
+Max:              1.06206e+06 ns (2241836 cycles)
+
+--- Gateway TCP Path Latency (t4->t5) ---
+Orders in Window: 20000
+Avg Latency:      97254.4 ns (205279 cycles)
+P50 (Median):     8843.32 ns (18666 cycles)
+P99:              1.01494e+06 ns (2142291 cycles)
+P99.9:            1.04845e+06 ns (2213012 cycles)
+P99.99:           1.05934e+06 ns (2236006 cycles)
+Max:              1.06211e+06 ns (2241836 cycles)
+
+Market-data reports dropped (ITCH queue full): 0
+Drop-copies dropped (drop-copy queue full): 0
+Engine Halted.
+
+# Gateway ingest throughput sweep (workers x clients): see
+#   benchmark_results.txt (regenerate with scripts/measure_throughput.py).
+# For the latency matrix across shard counts, re-run this script with
+#   GATEWAY_THREADS=1 / 2 / 4 / 8.
+#
+# NOTE: absolute latency/throughput here are a LOWER BOUND unless the box
+#   grants SCHED_FIFO (ulimit -r) and uses the 'performance' governor with
+#   isolated cores. The measurement code is complete; the numbers become
+#   publishable only on such hardware (docs/benchmarks.md, Phase 3.5).

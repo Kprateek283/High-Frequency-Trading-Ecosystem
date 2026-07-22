@@ -106,11 +106,33 @@ the load generators together exceed the available cores.
 > is recorded in the header of `benchmark_results.txt`. Treat the *shape* as the
 > result and re-run the script on isolated hardware for a real ceiling.
 >
-> **End-to-end latency remains `TODO(measure)`, deliberately.** Tail latency measures
-> exactly what arbitrary preemption ruins, and this box cannot grant `SCHED_FIFO`
-> (`ulimit -r` is 0). p99/p99.9 numbers taken here would describe the Linux scheduler,
-> not the engine — the same class of misleading figure this project already removed
-> once (review B9). The 1M–10M msgs/sec × threads matrix likewise stays open.
+> **End-to-end latency: the harness is complete; the *numbers* remain
+> `TODO(measure)`.** `run_sharding.sh` now runs with `LATENCY_PROFILE=1` and the
+> gateway emits e2e (`t1→t5`) and TCP-path (`t4→t5`) P50/P99/P99.9 alongside the
+> engine's matching-latency window, all in `results.txt`. But this box cannot grant
+> `SCHED_FIFO` (`ulimit -r` is 0) and runs a `powersave` governor, so the tail
+> describes the Linux scheduler, not the engine — the same class of misleading figure
+> this project already removed once (review B9). The measured values here are a
+> *lower bound*; publishable figures need an isolated box. The 1M–10M msgs/sec ×
+> threads matrix likewise stays open.
+
+### Reproducing the full matrix (one idle box away)
+
+Every quantity the matrix needs is now produced by a documented command — only the
+hardware is missing:
+
+```bash
+# Latency percentiles + cycle attribution + accepted/rejected, per shard count.
+# Re-run across the thread axis for the matrix rows:
+for gt in 1 2 4 8; do GATEWAY_THREADS=$gt ./scripts/run_sharding.sh; done   # -> results.txt
+
+# Ingest throughput sweep (workers x concurrent clients):
+python3 scripts/measure_throughput.py                                       # -> benchmark_results.txt
+```
+
+On a box that grants `SCHED_FIFO` (`ulimit -r unlimited`), pins to isolated cores
+(`isolcpus=`), and uses the `performance` governor, these same two commands turn the
+lower bounds above into the publishable matrix. No code change required.
 
 ### What *was* verified (functional run, `results.txt`)
 
