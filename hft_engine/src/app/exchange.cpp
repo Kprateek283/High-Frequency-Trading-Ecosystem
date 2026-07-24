@@ -120,29 +120,42 @@ int main() {
     order_manager.set_stats_region(stats);
     TCPServer server(9091, num_gw, engine_queues, gw_reject_queues, pools);
 
+    // Core assignments come from config.env (single config source, §6) so pinning
+    // tracks the isolcpus map instead of drifting from it. Gateway workers already
+    // read GATEWAY_CORES in worker_loop; engines read ENGINE_CORES and the aux
+    // threads read AUX_CORES ([0]=publisher, [1]=order_manager) here. Reuses
+    // core_for_worker() from tcp_server.h. Fallbacks reproduce the old hardcoded
+    // map for a direct launch that doesn't source config.env. The gateway
+    // dispatcher thread only spawns+joins the workers (idle after that), so it is
+    // not given a reserved core — it falls back when AUX_CORES has no third entry.
+    const char* engine_cores = std::getenv("ENGINE_CORES");
+    const char* aux_cores = std::getenv("AUX_CORES");
+    auto engine_core = [&](int i) { int c = core_for_worker(engine_cores, i); return c >= 0 ? c : (i * 2) + 2; };
+    auto aux_core = [&](int i, int fb) { int c = core_for_worker(aux_cores, i); return c >= 0 ? c : fb; };
+
     // 3. Spawn Threads and Pin to Isolated Cores
-    std::thread mkt_thread([&]() { 
-        set_realtime_priority(12); // E-Core
-        mkt_publisher.run(); 
+    std::thread mkt_thread([&]() {
+        set_realtime_priority(aux_core(0, 12)); // AUX_CORES[0] = publisher (fallback 12)
+        mkt_publisher.run();
     });
 
     std::array<std::thread, NUM_SHARDS> engine_threads;
     for (int i = 0; i < NUM_SHARDS; ++i) {
-        engine_threads[i] = std::thread([&engines, i]() {
-            set_realtime_priority((i * 2) + 2); // Avoid core 0 and 1, start at 2, uses 2, 4, 6, 8
+        engine_threads[i] = std::thread([&engines, &engine_core, i]() {
+            set_realtime_priority(engine_core(i)); // ENGINE_CORES (fallback 2,4,6,8)
             pthread_setname_np(pthread_self(), ("Engine-" + std::to_string(i)).c_str());
             engines[i]->run();
         });
     }
 
     std::thread server_thread([&]() {
-        set_realtime_priority(10); // E-Core
+        set_realtime_priority(aux_core(2, 10)); // idle dispatcher; AUX_CORES[2] or fallback 10
         pthread_setname_np(pthread_self(), "Gateway");
         server.run(g_running);
     });
 
     std::thread om_thread([&]() {
-        set_realtime_priority(14); // E-Core
+        set_realtime_priority(aux_core(1, 14)); // AUX_CORES[1] = order_manager (fallback 14)
         order_manager.run();
     });
 
