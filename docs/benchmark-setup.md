@@ -106,7 +106,9 @@ ENGINE_CORES=2,4,6,8      # engine shards
 AUX_CORES=0,9             # publisher, order_manager
 ```
 
-So isolate **cores 1–8** (leave 0 and the rest for the OS + load generator). Edit the
+So isolate **cores 1–8** — the gateway + engine hot path. Cores **0 and 9** host the
+aux threads (publisher, order_manager); they stay non-isolated alongside the OS and
+the load generator. (`scripts/setup_isolcpus.sh` writes exactly this GRUB line.) Edit the
 kernel command line in `/etc/default/grub`:
 
 ```
