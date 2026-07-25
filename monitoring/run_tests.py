@@ -9,8 +9,8 @@ import importlib
 
 MODULES = [
     "monitoring.wire", "monitoring.config", "monitoring.models", "monitoring.clock",
-    "monitoring.feeds.stats_reader", "monitoring.feeds.audit_reader",
-    "monitoring.feeds.multicast",
+    "monitoring.feeds.stats_reader", "monitoring.feeds.firm_stats_reader",
+    "monitoring.feeds.audit_reader", "monitoring.feeds.multicast",
     "monitoring.core.orderbook", "monitoring.core.metrics", "monitoring.health",
     "monitoring.orchestrator", "monitoring.tui.app",
 ]
