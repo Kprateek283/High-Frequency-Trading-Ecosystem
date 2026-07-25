@@ -10,6 +10,7 @@ Building a system capable of processing 10,000,000 messages per second exposes f
 | **EBADF Spin Loop** | Invalid FD mapping | Correct FD ownership |
 | **SIGBUS Crash** | Write past mmap'd audit log | Bound writes by `write_index` |
 | **Oversubscription** | Too many active threads | 4-thread operating point |
+| **Ack write blocking** | `O_NONBLOCK` fd, partial `send()`/`EAGAIN` | Buffer remainder + arm `EPOLLOUT` |
 
 > The cycle/millisecond figures in the war stories below are the **historical
 > observations from the original debugging episodes** (pre-fix, unoptimised engine,
@@ -97,3 +98,35 @@ This physically oversubscribed the CPU. The Linux OS scheduler was forced to pre
 
 ### The Resolution
 A 4-shard configuration is the established operating point for this machine (whether it beats 8 shards on the re-measured matrix is `TODO(measure)`). Thread affinity is **already implemented**, not future work: engines, publisher, gateway, and OrderManager are pinned via `pthread_setaffinity_np` + `SCHED_FIFO` (`app/exchange.cpp`), and Phase 3.2 extended pinning to the spawned gateway *worker* threads that previously floated (the last open item in [`known-issues.md`](./known-issues.md)). Scaling further would require a dedicated high-core-count server processor (AMD EPYC / Intel Xeon) with enough isolated cores to avoid oversubscription in the first place.
+
+---
+
+## 5. Non-Blocking Ack Egress & `EPOLLOUT` Backpressure
+
+### The Problem
+The private-ack channel makes the gateway a *writer* for the first time: it sends an
+`OuchExecutionReport` back on each client's own fd. But those fds are `O_NONBLOCK` +
+`EPOLLET`, so a naive `write()` can return `EAGAIN` or a **partial** byte count the moment
+the client is slow to read and the kernel send buffer fills. A blocking retry loop would
+stall the whole worker's `epoll` loop — the one thing this architecture cannot afford — and
+a client that closed mid-stream would raise `SIGPIPE` and kill the exchange.
+
+### The Investigation
+The send path is symmetric to the read path but with the failure modes reversed: reads
+drain until `EAGAIN` means *empty*; writes push until `EAGAIN` means *full*. The worker
+cannot spin waiting for the buffer to drain, because it must keep servicing every other fd
+and draining its `ack_queues` column. The kernel already signals writability — `EPOLLOUT` —
+so the fix is to hand the waiting back to `epoll` instead of looping in userspace.
+
+### The Resolution
+Each `ClientState` carries an out-buffer. To send: append the 32-byte report and try to
+flush with `send(fd, …, MSG_NOSIGNAL)`. On a full send → done. On partial/`EAGAIN` → keep
+the remainder and **arm `EPOLLOUT`** on that fd. When the fd next fires `EPOLLOUT` → flush
+the remainder; when it empties, **disarm** back to `EPOLLIN|EPOLLET`. `MSG_NOSIGNAL`
+suppresses `SIGPIPE` on a client that vanished mid-stream. If a client never reads and its
+out-buffer overflows, the connection is closed — backpressure of last resort (a slow client
+cannot be allowed to grow exchange memory without bound). This trades a rare disconnect for
+a bounded, non-blocking writer; it does **not** affect matched/recorded results, which flow
+down the independent drop-copy/audit path. The `EPOLLOUT` branch is currently reviewed by
+inspection only — a socketpair can't easily fill the send buffer to exercise it — tracked as
+an open test-coverage item in [`known-issues.md`](./known-issues.md).

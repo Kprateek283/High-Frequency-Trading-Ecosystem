@@ -9,6 +9,54 @@ config · **[MED]** scaling/stability · **[LOW]** cleanup/observability.
 
 ---
 
+## Open limitations — multi-firm + private-ack work
+
+These are **OPEN** (unlike the ✅ RESOLVED items further down). They ship with the
+multi-firm + private-ack loop now on `main`; none break the delivered scope, and each
+is a clear next increment. Mirrored from the known-limitations list in
+[`architecture-diagram.md`](./architecture-diagram.md).
+
+**Correctness / risk**
+
+1. **[MED] Risk position-limit lag.** `RiskManager::check_order` gates on *confirmed*
+   position, which lags fills, so a fast taker can blow through its cap (observed
+   position 104k vs a 10k limit). Fix: gate on `confirmed + in_flight` (pending
+   exposure) — `in_flight` is already published for exactly this.
+2. **[MED] Maker `in_flight` overcounts.** The firm consumes only `'E'` (fill) acks;
+   the exchange does not yet send NEW/CANCEL/REJECT acks (the private-ack plan's
+   deferred "second pass"), so canceled/replaced maker quotes never decrement
+   `in_flight` and it grows without bound.
+3. **[MED] Order-tracker capacity.** The firm's `order_tracker` is a fixed 1M-slot
+   array indexed by `internal_order_id`, and the strategy's counter grows unbounded —
+   past ~1M orders/firm, fills log "unknown Order ID". Long runs need slot reclaim/wrap.
+
+**Integration / operational**
+
+4. **[LOW] Ack channel can drop sustained non-reading clients.** Close-on-overflow
+   disconnects a client that never reads its acks *and* lets its 64KB out-buffer fill
+   (the `liquidity`/`tester` tools don't read acks). In practice `run_sharding.sh`
+   still produces **correct results** — matches are recorded in the audit log
+   independently of ack delivery, and typical socket buffers absorb the backflow
+   before overflow (verified: 20000 fills, 0 drops). A long/heavy non-reading client
+   on a small-buffer box could be disconnected mid-run; that truncates *that client's*
+   session, it does **not** corrupt matched/recorded results.
+5. **[LOW] Token partition is a convention, not cross-firm enforced.** Each firm
+   validates its own slice fits under `MAX_CLIENT_ORDERS`, but nothing stops two firms
+   being launched with the same `TOKEN_BASE`; correct non-overlapping assignment is the
+   launcher's/operator's responsibility.
+6. **[LOW] `FIRM_ID` is not recorded in the audit.** The exchange doesn't put the firm
+   id in drop copies, so per-firm *audit* attribution leans on token ranges (which the
+   seed tools muddy). Clean per-firm truth is each firm's own `/dev/shm` region.
+
+**Test coverage**
+
+7. **[LOW] `EPOLLOUT` backpressure path is untested.** The gateway's
+   partial-send/`EPOLLOUT` branch isn't exercised by a unit test (a socketpair can't
+   easily fill the send buffer); it's reviewed by inspection only (see
+   [`bottlenecks.md`](./bottlenecks.md) §5).
+
+---
+
 > ✅ **RESOLVED** (this branch). Each producer now owns its own SPSC queue and the
 > consumer fans in: engine ingress queues are per-`[shard][gateway-worker]`
 > (`Engine` drains its row), and gateway rejects go to per-worker
