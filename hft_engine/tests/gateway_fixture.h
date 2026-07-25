@@ -20,7 +20,7 @@ constexpr int TEST_PORT = 19091;
 
 struct GatewayFixture {
     std::array<std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>, NUM_SHARDS> queues;
-    std::array<std::vector<std::unique_ptr<LockFreeQueue<OuchExecutionReport, 524288>>>, NUM_SHARDS> ack_queues;
+    std::array<std::vector<std::unique_ptr<LockFreeQueue<OutboundAck, 524288>>>, NUM_SHARDS> ack_queues;
     std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>> reject_queues;
     std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS> pools;
     std::unique_ptr<TCPServer> server;
@@ -39,7 +39,7 @@ struct GatewayFixture {
         for (int s = 0; s < NUM_SHARDS; ++s) {
             pools[s] = std::make_unique<MemoryPool<Order>>(4096);
             queues[s].push_back(std::make_unique<LockFreeQueue<EngineTask, 524288>>());
-            ack_queues[s].push_back(std::make_unique<LockFreeQueue<OuchExecutionReport, 524288>>());
+            ack_queues[s].push_back(std::make_unique<LockFreeQueue<OutboundAck, 524288>>());
         }
         reject_queues.push_back(std::make_unique<LockFreeQueue<DropCopyMessage, 1048576>>());
         server = std::make_unique<TCPServer>(TEST_PORT, 1, queues, ack_queues, reject_queues, pools);

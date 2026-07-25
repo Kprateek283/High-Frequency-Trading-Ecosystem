@@ -87,7 +87,7 @@ int main() {
     // = engine shard s (sole writer of ack_queues[s][*]); consumer = gateway worker
     // w (sole reader of ack_queues[*][w]). One producer + one consumer per queue
     // keeps the LockFreeQueue SPSC contract (private-ack-plan §2).
-    std::array<std::vector<std::unique_ptr<LockFreeQueue<OuchExecutionReport, 524288>>>, NUM_SHARDS> ack_queues;
+    std::array<std::vector<std::unique_ptr<LockFreeQueue<OutboundAck, 524288>>>, NUM_SHARDS> ack_queues;
     std::array<std::unique_ptr<LockFreeQueue<TscTuple, 1048576>>, NUM_SHARDS> tsc_queues;
     std::array<std::unique_ptr<Engine>, NUM_SHARDS> engines;
 
@@ -102,7 +102,7 @@ int main() {
         tsc_queues[i] = std::make_unique<LockFreeQueue<TscTuple, 1048576>>();
         for (int w = 0; w < num_gw; ++w) {
             engine_queues[i].push_back(std::make_unique<LockFreeQueue<EngineTask, 524288>>());
-            ack_queues[i].push_back(std::make_unique<LockFreeQueue<OuchExecutionReport, 524288>>());
+            ack_queues[i].push_back(std::make_unique<LockFreeQueue<OutboundAck, 524288>>());
         }
         engines[i] = std::make_unique<Engine>(i, *pools[i], *mkt_data_queues[i], *drop_copy_queues[i], engine_queues[i], ack_queues[i], *tsc_queues[i], g_running);
     }
