@@ -211,7 +211,8 @@ public:
             
             // Loopback ACK to our Order Tracker via ExecutionEngine
             if (!action.is_cancel && exec_callback) {
-                exec_callback(action.internal_order_id, action.quantity);
+                exec_callback(action.internal_order_id, action.quantity,
+                              static_cast<uint32_t>(action.price));
             }
         }
     }

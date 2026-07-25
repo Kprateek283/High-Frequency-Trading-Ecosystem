@@ -126,8 +126,13 @@ public:
                                         char token_str[15];
                                         std::memcpy(token_str, rep->order_token, 14);
                                         token_str[14] = '\0';
-                                        uint64_t order_id = std::stoull(token_str);
-                                        exec_callback(order_id, rep->executed_shares); 
+                                        // Emitted token = token_base_ + internal_order_id (Stage 1);
+                                        // recover the firm's own internal_order_id to attribute the fill.
+                                        uint64_t token_val = std::stoull(token_str);
+                                        if (token_val >= token_base_) {
+                                            exec_callback(token_val - token_base_,
+                                                          rep->executed_shares, rep->execution_price);
+                                        }
                                     }
                                     offset += sizeof(OuchExecutionReport);
                                 } else {
