@@ -15,15 +15,18 @@ private:
   const int32_t MAX_POSITION = 10000;
   const uint64_t MSG_RATE_LIMIT_PER_SEC = 5000;
 
-  // State. Position is CONFIRMED (ack-driven): it only moves in on_fill, which
-  // is called from the execution report path. check_order below only READS it,
-  // so there is exactly one home for position and no intent/pre-send double count.
-  std::array<int32_t, 1000> current_positions{0};
+  // State. Position is CONFIRMED (ack-driven): it only moves in on_fill (tcp_rx
+  // thread). check_order (md thread) only READS it, so there is exactly one home
+  // for position and no intent/pre-send double count. Atomic (relaxed) makes the
+  // cross-thread access well-defined; these are independent counters, no ordering
+  // needed between them.
+  std::array<std::atomic<int32_t>, 1000> current_positions{};
   // Realized PnL as running fill cash-flow: sells add proceeds, buys subtract
-  // cost. Equals closed PnL whenever the position returns flat.
+  // cost. Equals closed PnL whenever the position returns flat. Written on the
+  // tcp_rx thread, sampled by the Stage-3 md-thread writer -> atomic.
   // ponytail: cash-flow proxy; switch to per-instrument average-cost if you need
   // realized-vs-unrealized split while holding inventory.
-  int64_t realized_pnl_ = 0;
+  std::atomic<int64_t> realized_pnl_{0};
 
   // Rate Limiting State
   uint64_t msg_count_this_second = 0;
@@ -48,19 +51,21 @@ public:
                       uint32_t price) {
     int64_t notional = static_cast<int64_t>(price) * qty;
     if (is_buy) {
-      current_positions[instrument_id] += qty;
-      realized_pnl_ -= notional;
+      current_positions[instrument_id].fetch_add((int32_t)qty, std::memory_order_relaxed);
+      realized_pnl_.fetch_sub(notional, std::memory_order_relaxed);
     } else {
-      current_positions[instrument_id] -= qty;
-      realized_pnl_ += notional;
+      current_positions[instrument_id].fetch_sub((int32_t)qty, std::memory_order_relaxed);
+      realized_pnl_.fetch_add(notional, std::memory_order_relaxed);
     }
   }
 
   // Read accessors for monitoring (Stage 3 seqlock writer samples these).
   inline int32_t position(uint16_t instrument_id) const {
-    return current_positions[instrument_id];
+    return current_positions[instrument_id].load(std::memory_order_relaxed);
   }
-  inline int64_t realized_pnl() const { return realized_pnl_; }
+  inline int64_t realized_pnl() const {
+    return realized_pnl_.load(std::memory_order_relaxed);
+  }
   inline bool kill_switch_engaged() const {
     return kill_switch.load(std::memory_order_acquire);
   }
@@ -83,7 +88,7 @@ public:
     }
 
     // 2. Inventory Check (Prevent accumulating too much risk)
-    int32_t current_pos = current_positions[action.instrument_id];
+    int32_t current_pos = current_positions[action.instrument_id].load(std::memory_order_relaxed);
     if (action.is_buy) {
       if (current_pos + (int32_t)action.quantity > MAX_POSITION) [[unlikely]] {
         return false;
