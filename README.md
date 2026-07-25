@@ -65,11 +65,24 @@ Matching Engine
         ▼
 RDTSCP Telemetry Pipeline
 ```
-For detailed architecture, see: [docs/architecture.md](./docs/architecture.md)
+The diagram above is the **ingress** path. The exchange now also closes the loop:
+it writes a private `OuchExecutionReport` back on each firm's own TCP session (a
+symmetric SPSC egress, `ack_queues[shard][worker]`, drained by the owning gateway
+worker with non-blocking send + `EPOLLOUT` backpressure). N **genuinely-different
+firms** — the same `LocalExchangeConnector` made distinct only by env (`FIRM_ID`,
+`TOKEN_BASE`, `STRATEGY` = `maker` | `taker`) — apply their confirmed fills to an
+ack-driven position/PnL and publish it to a per-firm `/dev/shm/firm_stats_<FIRM_ID>`
+seqlock region, which the Python TUI shows as one panel per firm.
+
+For the full multi-firm + private-ack picture, see
+[docs/architecture-diagram.md](./docs/architecture-diagram.md) (the authoritative
+full-system diagram, known-limitations list, and run/observe guide). For detailed
+subsystem architecture, see [docs/architecture.md](./docs/architecture.md).
 
 ## 4. Technical Documentation
 We treat documentation as a first-class citizen. Detailed technical deep-dives are available in the `docs/` directory:
 
+*   [**Full-System Diagram (`docs/architecture-diagram.md`)**](./docs/architecture-diagram.md): The authoritative CLI diagram of the multi-firm + private-ack loop, the known-limitations list, and the run/observe guide. Implementation specs live in [`docs/private-ack-plan.md`](./docs/private-ack-plan.md), [`docs/multi-firm-plan.md`](./docs/multi-firm-plan.md), and [`docs/firm-monitoring-plan.md`](./docs/firm-monitoring-plan.md).
 *   [**Architecture (`docs/architecture.md`)**](./docs/architecture.md): The dual-sided nature of the ecosystem, Thread-Per-Shard gateway, and Order Book design.
 *   [**Benchmarks & Capacity (`docs/benchmarks.md`)**](./docs/benchmarks.md): The 5-point latency decomposition, gateway CPU cycle attribution, the measured ingest sweep, and what is still `TODO(measure)` pending reference hardware.
 *   [**Benchmark Setup (`docs/benchmark-setup.md`)**](./docs/benchmark-setup.md): The three OS prerequisites (`SCHED_FIFO`, `performance` governor, `isolcpus`) that turn the lower-bound numbers into publishable ones — no code changes, environment only.
@@ -99,14 +112,18 @@ Trading-Ecosystem/
 │   ├── cpp-prep-for-python-monitoring.md
 │   └── agent-handoff.md
 ├── monitoring/             # Python monitoring layer (schema/readers/TUI/orchestrator)
+│   └── feeds/firm_stats_reader.py   # reads /dev/shm/firm_stats_*; discover() enumerates all firms
 ├── hft_engine/             # Core Exchange (Gateway, BookBuilder, Risk)
 │   ├── src/
 │   └── CMakeLists.txt
 ├── hft-trading-firm/       # Client Simulator (Load Generator, Batching)
-│   ├── src/
-│   └── CMakeLists.txt
+│   ├── src/                # strategy/{istrategy,market_maker,taker}.h (maker | taker via IStrategy)
+│   └── CMakeLists.txt      # CryptoPaperConnector opt-in via -DWITH_CRYPTO (default OFF)
 └── scripts/                # Automation, benchmarking and analysis
     ├── run_sharding.sh           # documented benchmark entry point → results.txt
+    ├── multi_firm_run.sh         # launch N firms (maker/taker), seed book, print evidence
+    ├── multi_firm_evidence.py    # per-firm token-range / fill evidence for the launcher
+    ├── multi_firm_demo.sh        # legacy injector-tools demo (liquidity/tester, no strategy)
     ├── decode_audit.py           # decodes order_audit.log (run_sharding.sh calls it)
     ├── measure_throughput.py     # gateway ingest sweep → benchmark_results.txt
     ├── plot.py                   # charts from results.txt
@@ -131,6 +148,32 @@ cd ..
 # View benchmark results
 cat results.txt
 ```
+
+### Multi-firm run (N competing firms + private-ack loop)
+Build both sides separately; the firm needs **no** OpenSSL/curl/simdjson because the
+`CryptoPaperConnector` is opt-in (`-DWITH_CRYPTO=ON`, default OFF):
+```bash
+cmake -S hft_engine       -B build-eng  -DCMAKE_BUILD_TYPE=Release && cmake --build build-eng  -j$(nproc)
+cmake -S hft-trading-firm -B build-firm -DCMAKE_BUILD_TYPE=Release && cmake --build build-firm -j$(nproc)
+```
+`scripts/multi_firm_run.sh` launches `NUM_FIRMS` (default 2, max `MAX_FIRMS=16`) firms,
+auto-assigning `FIRM_ID` (A,B,C,…), a disjoint `TOKEN_BASE = k*TOKEN_SLICE`
+(`TOKEN_SLICE = 50M/16 = 3,125,000`), and an alternating `maker`/`taker` strategy; it
+seeds the book, drives flow, and prints per-firm evidence:
+```bash
+BIN=build-eng FIRM_BIN=build-firm ./scripts/multi_firm_run.sh                          # 2 firms: A maker, B taker
+NUM_FIRMS=4 BIN=build-eng FIRM_BIN=build-firm ./scripts/multi_firm_run.sh              # A,B,C,D (maker/taker alternating)
+RUN_SECONDS=120 NUM_FIRMS=6 BIN=build-eng FIRM_BIN=build-firm ./scripts/multi_firm_run.sh   # keep alive for the TUI
+```
+Watch the exchange **and every firm** live (needs `rich`) — the reader's `discover()`
+enumerates all `/dev/shm/firm_stats_*` regions, so every running firm gets a panel:
+```bash
+python3 -m monitoring.tui.app        # Exchange panel + one panel per firm (position, realized PnL, in_flight, cycles)
+```
+> Any per-firm fill/position figures from these runs are **illustrative lower bounds on
+> a developer box**, not benchmarks — throughput/latency remain `TODO(measure)` (below).
+> Strategy env knobs: `MM_SPREAD` / `MM_IMBALANCE` / `MM_SIZE` (maker),
+> `TAKER_THRESHOLD` / `TAKER_SIZE` (taker).
 
 ### Python monitoring layer (optional)
 The C++ engine above needs nothing from Python. The `monitoring/` package is
