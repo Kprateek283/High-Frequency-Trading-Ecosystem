@@ -166,4 +166,47 @@ void test_framing() {
         CHECK(f.rejects_enqueued() == 1);
         CHECK(f.tasks_enqueued() == 1);
     }
+
+    // --- Private ack: a drained OutboundAck is written back to its owner (§4). ---
+    // No live engine here, so inject the ack the engine would have produced, then
+    // run the worker's drain and read the 32 wire bytes off the peer socket. The
+    // token must round-trip so the firm can attribute the fill.
+    {
+        GatewayFixture f;
+        size_t c = f.connect(77);              // this connection is client_id 77
+        OutboundAck ack{};
+        ack.report.msg_type = 'E';
+        encode_order_token(ack.report.order_token, 12345);
+        ack.report.executed_shares = 100;
+        ack.report.execution_price = 50000;
+        ack.report.liquidity_flag = 'R';
+        ack.client_id = 77;
+        f.inject_ack(ack, 0);
+        f.pump_acks();
+
+        OuchExecutionReport got{};
+        ssize_t n = read(f.conns[c].client_fd, &got, sizeof(got));
+        CHECK(n == (ssize_t)sizeof(got));
+        CHECK(got.msg_type == 'E');
+        CHECK(decode_order_token(got.order_token) == 12345);
+        CHECK(got.executed_shares == 100);
+        CHECK(got.execution_price == 50000);
+        CHECK(got.liquidity_flag == 'R');
+    }
+
+    // --- An ack for an unknown client_id is silently dropped, not written. ---
+    {
+        GatewayFixture f;
+        size_t c = f.connect(5);
+        OutboundAck ack{};
+        ack.report.msg_type = 'E';
+        ack.client_id = 999;                   // nobody
+        f.inject_ack(ack, 0);
+        f.pump_acks();
+        char byte;
+        // Peer end is non-blocking here so an empty socket returns EAGAIN, not block.
+        int flags = fcntl(f.conns[c].client_fd, F_GETFL, 0);
+        fcntl(f.conns[c].client_fd, F_SETFL, flags | O_NONBLOCK);
+        CHECK(read(f.conns[c].client_fd, &byte, 1) < 0);   // nothing was written
+    }
 }

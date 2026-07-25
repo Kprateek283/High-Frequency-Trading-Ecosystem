@@ -78,4 +78,16 @@ void test_wire() {
     CHECK(offsetof(AuditLogHeader, version) == 8);
     CHECK(offsetof(AuditLogHeader, entry_size) == 12);
     CHECK(offsetof(AuditLogHeader, write_index) == 16);
+
+    // Private-ack echo (§3): encode_order_token must invert decode_order_token for
+    // every token the gateway accepts, including 0 and the 14-digit maximum. This
+    // round-trip is what lets a firm attribute a fill to its own order token.
+    {
+        char t[14];
+        const uint64_t cases[] = {0ULL, 1ULL, 42ULL, 12345ULL, 99999999999999ULL};
+        for (uint64_t v : cases) {
+            encode_order_token(t, v);
+            CHECK(decode_order_token(t) == v);
+        }
+    }
 }

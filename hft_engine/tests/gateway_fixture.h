@@ -25,6 +25,7 @@ struct GatewayFixture {
     std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS> pools;
     std::unique_ptr<TCPServer> server;
     std::unordered_map<int, TCPServer::ClientState> states;
+    std::unordered_map<uint32_t, int> fd_by_client;
 
     // One entry per simulated connection.
     struct Conn {
@@ -71,11 +72,20 @@ struct GatewayFixture {
         fcntl(c.server_fd, F_SETFL, flags | O_NONBLOCK);
 
         states[c.server_fd].client_id = client_id;
+        fd_by_client[client_id] = c.server_fd;
         conns.push_back(c);
         return conns.size() - 1;
     }
 
-    void pump(size_t conn = 0) { server->handle_client(conns[conn].server_fd, states, 0); }
+    void pump(size_t conn = 0) { server->handle_client(conns[conn].server_fd, states, fd_by_client, 0); }
+
+    // Injects an ack into worker 0's queue for `shard`, then runs the drain the way
+    // worker_loop does. epoll_fds[0] exists (ctor) but the socketpair fds aren't
+    // registered on it; a small report flushes in one send, so no EPOLLOUT MOD fires.
+    void inject_ack(const OutboundAck& ack, int shard = 0) {
+        CHECK(ack_queues[shard][0]->push(ack));
+    }
+    void pump_acks() { server->drain_acks(0, states, fd_by_client, server->epoll_fds[0]); }
 
     void send_bytes(const void* p, size_t n, size_t conn = 0) {
         CHECK(write(conns[conn].client_fd, p, n) == (ssize_t)n);

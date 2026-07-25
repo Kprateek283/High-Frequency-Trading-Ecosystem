@@ -15,6 +15,8 @@
 #include <sched.h>
 #include <cstdlib>
 #include <string>
+#include <csignal>
+#include <cerrno>
 #include "core/lock_free_queue.h"
 #include "core/memory_pool.h"
 #include "matching/order.h"
@@ -84,6 +86,10 @@ public:
         num_threads = threads;
         if (num_threads < 1) num_threads = 1;
         if (num_threads > 16) num_threads = 16;
+
+        // Belt-and-suspenders with MSG_NOSIGNAL on every send: a client that closed
+        // mid-stream must never SIGPIPE the exchange down.
+        std::signal(SIGPIPE, SIG_IGN);
 
         // Raise the open-fd soft limit toward the hard limit so the gateway isn't
         // capped near the default ~1024 concurrent connections. Per-connection state
@@ -206,6 +212,9 @@ public:
         // 1024-fd limit) and no giant up-front allocation — state is created on accept
         // and destroyed on close. Owned by this worker, so no cross-thread sharing.
         std::unordered_map<int, ClientState> client_states;
+        // Reverse map so a drained ack (which carries client_id, not fd) can find
+        // the socket. Worker-local, like client_states: only this thread touches it.
+        std::unordered_map<uint32_t, int> fd_by_client;
 
         struct epoll_event events[64];
         while (running.load(std::memory_order_relaxed)) {
@@ -233,17 +242,34 @@ public:
                     // Identity is assigned here, from the connection, and never
                     // from a client-controlled field. Ids start at 1 so that 0
                     // stays available as "no client" in the session map.
-                    client_states[client_fd].client_id =
-                        next_client_id.fetch_add(1, std::memory_order_relaxed);
+                    uint32_t cid = next_client_id.fetch_add(1, std::memory_order_relaxed);
+                    client_states[client_fd].client_id = cid;
+                    fd_by_client[cid] = client_fd;
 
                     struct epoll_event ev;
                     ev.events = EPOLLIN | EPOLLET;
                     ev.data.fd = client_fd;
                     epoll_ctl(e_fd, EPOLL_CTL_ADD, client_fd, &ev);
                 } else {
-                    handle_client(events[i].data.fd, client_states, thread_id);
+                    int fd = events[i].data.fd;
+                    // Flush any backed-up acks first; if that fatally fails the fd is
+                    // gone, so skip the read. Then service inbound orders/cancels.
+                    if (events[i].events & EPOLLOUT) {
+                        auto sit = client_states.find(fd);
+                        if (sit != client_states.end() && flush_out(fd, sit->second, e_fd) < 0) {
+                            close_client(fd, client_states, fd_by_client);
+                            continue;
+                        }
+                    }
+                    if (events[i].events & (EPOLLIN | EPOLLERR | EPOLLHUP)) {
+                        handle_client(fd, client_states, fd_by_client, thread_id);
+                    }
                 }
             }
+
+            // After servicing this batch, push out every private ack the engines
+            // produced for this worker's clients.
+            drain_acks(thread_id, client_states, fd_by_client, e_fd);
         }
     }
 
@@ -270,11 +296,101 @@ public:
         // This connection's identity, assigned by the gateway on accept. Never
         // derived from anything the client sends (review A6).
         uint32_t client_id = 0;
+
+        // Egress side (private acks, §4). Reports we couldn't push to the socket in
+        // one shot back up here; EPOLLOUT resumes the flush. If a slow client lets
+        // this overflow, the connection is dropped — it can't keep up.
+        static constexpr size_t OUT_BUF_CAP = 65536;   // 2048 back-to-back reports
+        char out_buf[OUT_BUF_CAP];
+        size_t out_len = 0;
+        bool want_write = false;   // EPOLLOUT currently armed for this fd
     };
+
+    // Single teardown path for a client fd: drop both map directions then close.
+    // close() alone removes the fd from epoll (no dup exists), matching the old
+    // close+erase sites. Every close in the gateway routes through here so the
+    // reverse map can never leak a stale client_id->fd entry.
+    void close_client(int fd, std::unordered_map<int, ClientState>& states,
+                      std::unordered_map<uint32_t, int>& fd_by_client) {
+        auto it = states.find(fd);
+        if (it != states.end()) {
+            fd_by_client.erase(it->second.client_id);
+            states.erase(it);
+        }
+        close(fd);
+    }
+
+    // Arm/disarm EPOLLOUT for this fd (edge-triggered, alongside the standing
+    // EPOLLIN|EPOLLET). No-op if already in the requested state.
+    void arm_epollout(int fd, ClientState& state, int e_fd, bool on) {
+        if (state.want_write == on) return;
+        state.want_write = on;
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET;
+        if (on) ev.events |= EPOLLOUT;
+        ev.data.fd = fd;
+        epoll_ctl(e_fd, EPOLL_CTL_MOD, fd, &ev);
+    }
+
+    // Drain out_buf to the socket. Non-blocking: arms EPOLLOUT on a partial/EAGAIN
+    // and resumes on the next writable edge; disarms once fully flushed. Returns
+    // -1 on a fatal send error so the caller tears the connection down.
+    int flush_out(int fd, ClientState& state, int e_fd) {
+        while (state.out_len > 0) {
+            ssize_t n = send(fd, state.out_buf, state.out_len, MSG_NOSIGNAL);
+            if (n > 0) {
+                state.out_len -= (size_t)n;
+                if (state.out_len > 0) {
+                    std::memmove(state.out_buf, state.out_buf + n, state.out_len);
+                }
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                arm_epollout(fd, state, e_fd, true);
+                return 0;   // kernel buffer full; resume on EPOLLOUT
+            } else {
+                return -1;  // fatal (e.g. peer reset)
+            }
+        }
+        arm_epollout(fd, state, e_fd, false);   // fully flushed -> EPOLLIN only
+        return 0;
+    }
+
+    // Append `len` bytes and try to flush. Tears the connection down on overflow
+    // (slow client) or a fatal send error. `data` must be the wire bytes only.
+    void send_report(int fd, ClientState& state, int e_fd,
+                     std::unordered_map<int, ClientState>& states,
+                     std::unordered_map<uint32_t, int>& fd_by_client,
+                     const void* data, size_t len) {
+        if (state.out_len + len > sizeof(state.out_buf)) {
+            close_client(fd, states, fd_by_client);
+            return;
+        }
+        std::memcpy(state.out_buf + state.out_len, data, len);
+        state.out_len += len;
+        if (flush_out(fd, state, e_fd) < 0) close_client(fd, states, fd_by_client);
+    }
+
+    // Drain this worker's ack queue across every shard (a worker's clients trade on
+    // all shards) and write each report to the owning client's fd. Only the 32 wire
+    // bytes go out; the OutboundAck wrapper's client_id is used to find the fd and
+    // is never sent. Public so the fixture can drive it without a live engine.
+    void drain_acks(int worker_id, std::unordered_map<int, ClientState>& states,
+                    std::unordered_map<uint32_t, int>& fd_by_client, int e_fd) {
+        OutboundAck ack;
+        for (int s = 0; s < NUM_SHARDS; ++s) {
+            while (ack_queues[s][worker_id]->pop(ack)) {
+                auto it = fd_by_client.find(ack.client_id);
+                if (it == fd_by_client.end()) continue;   // client disconnected
+                int fd = it->second;
+                send_report(fd, states[fd], e_fd, states, fd_by_client,
+                            &ack.report, sizeof(ack.report));
+            }
+        }
+    }
 
     // Public only so the framing tests can drive it over a socketpair without a
     // live listener; in production only worker_loop calls it.
-    void handle_client(int fd, std::unordered_map<int, ClientState>& states, int worker_id) {
+    void handle_client(int fd, std::unordered_map<int, ClientState>& states,
+                       std::unordered_map<uint32_t, int>& fd_by_client, int worker_id) {
         auto it = states.find(fd);
         if (it == states.end()) return;
         ClientState& state = it->second;
@@ -295,8 +411,7 @@ public:
             if (remaining_space == 0) {
                 // A single unparsed fragment fills the whole buffer => malformed /
                 // oversized framing. Drop the connection rather than corrupt the stream.
-                close(fd);
-                states.erase(fd);
+                close_client(fd, states, fd_by_client);
                 return;
             }
 
@@ -317,8 +432,7 @@ public:
                     if (msg_type == 'O') msg_size = sizeof(OuchEnterOrder);
                     else if (msg_type == 'X') msg_size = sizeof(OuchCancelOrder);
                     else {
-                        close(fd);
-                        states.erase(fd);
+                        close_client(fd, states, fd_by_client);
                         return;
                     }
 
@@ -438,13 +552,11 @@ public:
                 
                 // Buffer reclamation happens at the top of the next loop iteration.
             } else if (n == 0) {
-                close(fd);
-                states.erase(fd);
+                close_client(fd, states, fd_by_client);
                 return;
             } else {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    close(fd);
-                    states.erase(fd);
+                    close_client(fd, states, fd_by_client);
                 }
                 return; // EAGAIN: socket drained, keep the connection for next event
             }
