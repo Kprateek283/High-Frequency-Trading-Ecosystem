@@ -135,23 +135,29 @@ cmake -S hft_engine       -B build-eng  -DCMAKE_BUILD_TYPE=Release && cmake --bu
 cmake -S hft-trading-firm -B build-firm -DCMAKE_BUILD_TYPE=Release && cmake --build build-firm -j$(nproc)
 ```
 
-**End-to-end run (prints evidence):**
+**End-to-end run (prints evidence).** `NUM_FIRMS` (default 2, max `MAX_FIRMS=16`)
+controls how many firms; the launcher auto-assigns `FIRM_ID` (A,B,C,…), a disjoint
+`TOKEN_BASE = k*SLICE`, and an alternating `maker`/`taker` strategy per firm, seeds
+the book, drives flow, and prints per-firm evidence:
 ```bash
-BIN=build-eng FIRM_BIN=build-firm ./scripts/multi_firm_run.sh          # 2 firms: A maker, B taker
-RUN_SECONDS=120 BIN=build-eng FIRM_BIN=build-firm ./scripts/multi_firm_run.sh   # keep it alive to watch the TUI
+BIN=build-eng FIRM_BIN=build-firm ./scripts/multi_firm_run.sh                 # 2 firms: A maker, B taker
+NUM_FIRMS=4 BIN=build-eng FIRM_BIN=build-firm ./scripts/multi_firm_run.sh     # A,B,C,D (maker/taker alternating)
+RUN_SECONDS=120 NUM_FIRMS=6 BIN=build-eng FIRM_BIN=build-firm ./scripts/multi_firm_run.sh   # keep alive for the TUI
 ```
+Verified: `NUM_FIRMS=4` → 4 firms, each confined to its own 3.125M-wide token
+slice (non-overlapping: PASS), all crossing into confirmed fills with per-firm
+position/PnL moving.
 
 **Watch the TUI (exchange + every firm), live:** with a long `RUN_SECONDS` run
 going in one terminal, in another terminal:
 ```bash
-python3 -m monitoring.tui.app        # needs `rich`; shows the Exchange panel + one panel per /dev/shm/firm_stats_*
+python3 -m monitoring.tui.app        # needs `rich`; Exchange panel + one panel per /dev/shm/firm_stats_*
 ```
 The reader's `discover()` enumerates all `firm_stats_*` regions, so every running
-firm gets a panel automatically.
+firm gets a panel automatically — no matter how many `NUM_FIRMS` you launched.
 
-**Control the number of firms (up to `MAX_FIRMS=16`).** The launcher ships 2 firms;
-to run N, launch `trading_firm` yourself with a distinct slice per firm (seed the
-book first with the `market_maker` tool so makers can quote):
+**Launching firms by hand** (if you want non-alternating strategies or custom ids),
+seed the book first so makers can quote:
 ```bash
 build-eng/exchange &                       # or via the launcher's exchange
 build-eng/market_maker &                   # seed a standing two-sided book
