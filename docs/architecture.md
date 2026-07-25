@@ -71,6 +71,27 @@
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+The diagram above is the **ingress** path. Every match also fans out on **three
+channels** — public market data, a private ack, and the drop copy:
+
+```text
+   Matching Engine (per fill, BOTH sides of the trade)
+        |
+        +--> mkt_data_q --> Publisher --> ITCH multicast (UDP, anonymous)     [public]
+        |
+        +--> ack_queues[shard][worker] (OuchExecutionReport, SPSC egress)     [private]
+        |       routed by order->worker_id --> owning Gateway worker drains
+        |       after epoll_wait --> writes back on the originating client fd
+        |       (non-blocking send + EPOLLOUT backpressure)
+        |
+        +--> drop_copy_q --> OrderManager --> order_audit.log + /dev/shm/hft_stats  [audit]
+```
+
+The private-ack egress **mirrors the ingress SPSC fabric exactly**: engine shard `s`
+is the sole producer into `ack_queues[s][*]`, gateway worker `w` the sole consumer of
+`ack_queues[*][w]` (see Component Breakdown item 5). The full multi-firm + ack-loop
+picture is in [architecture-diagram.md](./architecture-diagram.md).
+
 ## 2. Threading Model
 
 Under `SO_REUSEPORT`, any gateway worker can receive an order for **any** instrument, so
@@ -125,3 +146,30 @@ At startup, massive contiguous byte arrays are pre-allocated. When an order arri
 ### 4. Telemetry Pipeline
 Measuring sub-microsecond events using conventional software timers introduces significant observer overhead. Even with vDSO optimizations, `clock_gettime()` may still introduce measurable observer overhead relative to direct TSC reads.
 The system bypasses software timers entirely. We use the `__rdtscp` compiler intrinsic to read the CPU's internal cycle counter directly from the silicon. `__rdtscp` (unlike `__rdtsc`) waits for prior instructions to retire before reading the counter, so it already serialises against prior loads — no separate `_mm_lfence()` is required.
+
+### 5. Private-Ack Egress (symmetric SPSC)
+The exchange writes a private `OuchExecutionReport` back to the originating client on
+its own order-entry socket. Because a client fd is owned by exactly one gateway worker
+but fills are produced on engine threads, each report is routed back to the owning
+worker over an **egress fabric that mirrors ingress**: `ack_queues[shard][worker]`, where
+engine shard `s` is the sole producer into `ack_queues[s][*]` and gateway worker `w` the
+sole consumer of `ack_queues[*][w]` — the same single-producer/single-consumer invariant
+as the ingress `queues[shard][worker]`. `Order` carries a `worker_id` (stamped at
+allocation) so both sides of every fill route to the right worker. The worker drains its
+column after `epoll_wait` and writes non-blocking (`send` + `MSG_NOSIGNAL`), arming
+`EPOLLOUT` on a partial send and closing a client whose out-buffer overflows. This leaves
+`DropCopyMessage`, the audit format, and the entire Python layer untouched (see
+[`private-ack-plan.md`](./private-ack-plan.md)).
+
+### 6. Multi-Firm & Firm Monitoring
+N trading firms run as separate processes of the **same** `LocalExchangeConnector`, made
+distinct only by env: `FIRM_ID` (stamped in `req.firm`), `TOKEN_BASE` (partitions the
+exchange's 50M `SessionManager` token space into `MAX_FIRMS=16` slices of
+`TOKEN_SLICE=3,125,000` so firms never collide), and `STRATEGY` = `maker` | `taker`
+(via the `IStrategy` interface). Each firm's `tcp_rx_thread` applies its confirmed
+`OuchExecutionReport`s to an **ack-driven** position + realized PnL, then publishes them
+(every ~100 ms, single writer) to a per-firm seqlock region at
+`/dev/shm/firm_stats_<FIRM_ID>` — the same pattern as the exchange's `/dev/shm/hft_stats`.
+The Python `firm_stats_reader.discover()` enumerates every firm region, so the TUI shows
+one panel per participant alongside the exchange (see
+[`multi-firm-plan.md`](./multi-firm-plan.md), [`firm-monitoring-plan.md`](./firm-monitoring-plan.md)).
