@@ -30,6 +30,15 @@ private:
     std::atomic<uint64_t> total_dequeue_cycles{0};
     std::atomic<uint64_t> total_orders_sent{0};
 
+    // Multi-firm identity (multi-firm-plan Part A). Defaults reproduce today's
+    // single-firm behavior: FIRM_ID="HFT1", TOKEN_BASE=0.
+    static constexpr uint64_t MAX_FIRMS = 16;
+    // Must match SessionManager::MAX_CLIENT_ORDERS (hft_engine/src/gateway/session_manager.h).
+    static constexpr uint64_t MAX_CLIENT_ORDERS = 50000000;
+    static constexpr uint64_t TOKEN_SLICE = MAX_CLIENT_ORDERS / MAX_FIRMS;
+    char firm_id_[4] = {'H', 'F', 'T', '1'};
+    uint64_t token_base_ = 0;
+
     ExecutionCallback exec_callback;
     std::thread tcp_rx_thread;
     std::thread network_tx_thread;
@@ -60,6 +69,28 @@ public:
         const char* threads_env = std::getenv("GATEWAY_THREADS");
         if (threads_env) num_connections = std::atoi(threads_env);
         if (num_connections < 1) num_connections = 1;
+
+        // Multi-firm identity: FIRM_ID -> req.firm, TOKEN_BASE partitions the
+        // exchange's 50M token space so firms don't overwrite each other's
+        // SessionManager entries. Defaults keep today's single-firm behavior.
+        const char* firm_env = std::getenv("FIRM_ID");
+        if (firm_env) {
+            std::memset(firm_id_, ' ', 4);
+            size_t flen = std::strlen(firm_env);
+            if (flen > 4) flen = 4;
+            std::memcpy(firm_id_, firm_env, flen);
+        }
+        const char* token_base_env = std::getenv("TOKEN_BASE");
+        if (token_base_env) token_base_ = std::strtoull(token_base_env, nullptr, 10);
+        // Each firm owns [TOKEN_BASE, TOKEN_BASE + TOKEN_SLICE); the whole slice
+        // must stay strictly under MAX_CLIENT_ORDERS (per-order tokens are
+        // token_base_ + internal_order_id, and the counter stays within a slice).
+        if (token_base_ + TOKEN_SLICE > MAX_CLIENT_ORDERS) {
+            std::cerr << "[LocalConnector] TOKEN_BASE " << token_base_
+                      << " + slice " << TOKEN_SLICE << " exceeds MAX_CLIENT_ORDERS "
+                      << MAX_CLIENT_ORDERS << "\n";
+            return false;
+        }
 
         try {
             // Bind to Multicast ITCH Group FIRST so we don't miss packets when TCP connects
@@ -134,7 +165,7 @@ public:
                             req.msg_type = 'O';
                             std::memset(req.order_token, '0', 14);
                             char temp[14];
-                            auto [ptr, ec] = std::to_chars(temp, temp + 14, action.internal_order_id);
+                            auto [ptr, ec] = std::to_chars(temp, temp + 14, token_base_ + action.internal_order_id);
                             size_t len = ptr - temp;
                             std::memcpy(req.order_token + (14 - len), temp, len);
                             
@@ -148,7 +179,7 @@ public:
                             
                             req.price = action.price;
                             req.time_in_force = 99998;
-                            std::memcpy(req.firm, "HFT1", 4);
+                            std::memcpy(req.firm, firm_id_, 4);
                             req.display = 'Y';
                             req.capacity = 'P';
                             req.iso_eligibility = 'Y';
@@ -202,7 +233,7 @@ public:
 
                             std::memset(req.order_token, '0', 14);
                             char temp[14];
-                            auto [ptr, ec] = std::to_chars(temp, temp + 14, action.internal_order_id);
+                            auto [ptr, ec] = std::to_chars(temp, temp + 14, token_base_ + action.internal_order_id);
                             size_t len = ptr - temp;
                             std::memcpy(req.order_token + (14 - len), temp, len);
                             
@@ -216,7 +247,7 @@ public:
                             
                             req.price = action.price;
                             req.time_in_force = 99998; // DAY
-                            std::memcpy(req.firm, "HFT1", 4);
+                            std::memcpy(req.firm, firm_id_, 4);
                             req.display = 'Y';
                             req.capacity = 'P';
                             req.iso_eligibility = 'Y';
@@ -245,7 +276,7 @@ public:
 
                             std::memset(req.order_token, '0', 14);
                             char temp[14];
-                            auto [ptr, ec] = std::to_chars(temp, temp + 14, action.internal_order_id);
+                            auto [ptr, ec] = std::to_chars(temp, temp + 14, token_base_ + action.internal_order_id);
                             size_t len = ptr - temp;
                             std::memcpy(req.order_token + (14 - len), temp, len);
                             
