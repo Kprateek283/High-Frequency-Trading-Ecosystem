@@ -375,7 +375,7 @@ public:
                         }
 
                         uint16_t shard = inst % NUM_SHARDS;
-                        Order* o = pools[shard]->allocate(0, order_token, client_id, req.price, req.shares, inst, side);
+                        Order* o = pools[shard]->allocate(0, order_token, client_id, req.price, req.shares, inst, side, static_cast<uint16_t>(worker_id));
                         if (!o) [[unlikely]] {
                             // Pool exhausted: too many live orders in this shard. The
                             // order never enters the book; reject it like a risk reject

@@ -19,6 +19,8 @@ struct alignas(64) Order {
     uint32_t quantity;
     uint32_t client_id;        // owning connection (server-assigned identity)
     uint16_t instrument_id;
+    uint16_t worker_id;        // gateway worker owning this order's client fd;
+                               // routes the private ack back (private-ack-plan §1)
     Side side;
 
     Order* next = nullptr;
@@ -27,10 +29,10 @@ struct alignas(64) Order {
     Order() = default;
 
     Order(uint64_t int_id, uint64_t client_order_tok, uint32_t owner, uint64_t p,
-          uint32_t q, uint16_t inst, Side s)
+          uint32_t q, uint16_t inst, Side s, uint16_t wid = 0)
         : internal_id(int_id), client_order_id(client_order_tok), price(p),
-          quantity(q), client_id(owner), instrument_id(inst), side(s),
-          next(nullptr), prev(nullptr) {}
+          quantity(q), client_id(owner), instrument_id(inst), worker_id(wid),
+          side(s), next(nullptr), prev(nullptr) {}
 };
 
 // Padded/Aligned to 32 bytes to ensure it cleanly fits in cache lines in LockFreeQueue
