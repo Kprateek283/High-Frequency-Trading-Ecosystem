@@ -76,9 +76,10 @@ public:
     // queue keeps LockFreeQueue's SPSC contract intact under a multi-threaded gateway.
     TCPServer(int port, int threads,
               std::array<std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>, NUM_SHARDS>& qs,
+              std::array<std::vector<std::unique_ptr<LockFreeQueue<OuchExecutionReport, 524288>>>, NUM_SHARDS>& ack_qs,
               std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& reject_qs,
               std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS>& ps)
-        : port(port), queues(qs), gw_reject_queues(reject_qs), pools(ps) {
+        : port(port), queues(qs), ack_queues(ack_qs), gw_reject_queues(reject_qs), pools(ps) {
 
         num_threads = threads;
         if (num_threads < 1) num_threads = 1;
@@ -457,6 +458,9 @@ private:
     std::atomic<uint32_t> next_client_id{1};
 
     std::array<std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>, NUM_SHARDS>& queues;
+    // Egress ack queues [shard][worker]; this worker drains ack_queues[*][thread_id]
+    // (Step 2 plumbing; drained + written in Step 4).
+    std::array<std::vector<std::unique_ptr<LockFreeQueue<OuchExecutionReport, 524288>>>, NUM_SHARDS>& ack_queues;
     std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>>& gw_reject_queues;
     std::array<std::unique_ptr<MemoryPool<Order>>, NUM_SHARDS>& pools;
     RiskEngine risk_engine;

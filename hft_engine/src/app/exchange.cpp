@@ -83,6 +83,11 @@ int main() {
     std::array<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>, NUM_SHARDS> drop_copy_queues;
     std::vector<std::unique_ptr<LockFreeQueue<DropCopyMessage, 1048576>>> gw_reject_queues; // one per gateway worker
     std::array<std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>, NUM_SHARDS> engine_queues; // [shard][worker]
+    // Egress mirror of engine_queues: private OUCH acks, [shard][worker]. Producer
+    // = engine shard s (sole writer of ack_queues[s][*]); consumer = gateway worker
+    // w (sole reader of ack_queues[*][w]). One producer + one consumer per queue
+    // keeps the LockFreeQueue SPSC contract (private-ack-plan §2).
+    std::array<std::vector<std::unique_ptr<LockFreeQueue<OuchExecutionReport, 524288>>>, NUM_SHARDS> ack_queues;
     std::array<std::unique_ptr<LockFreeQueue<TscTuple, 1048576>>, NUM_SHARDS> tsc_queues;
     std::array<std::unique_ptr<Engine>, NUM_SHARDS> engines;
 
@@ -97,8 +102,9 @@ int main() {
         tsc_queues[i] = std::make_unique<LockFreeQueue<TscTuple, 1048576>>();
         for (int w = 0; w < num_gw; ++w) {
             engine_queues[i].push_back(std::make_unique<LockFreeQueue<EngineTask, 524288>>());
+            ack_queues[i].push_back(std::make_unique<LockFreeQueue<OuchExecutionReport, 524288>>());
         }
-        engines[i] = std::make_unique<Engine>(i, *pools[i], *mkt_data_queues[i], *drop_copy_queues[i], engine_queues[i], *tsc_queues[i], g_running);
+        engines[i] = std::make_unique<Engine>(i, *pools[i], *mkt_data_queues[i], *drop_copy_queues[i], engine_queues[i], ack_queues[i], *tsc_queues[i], g_running);
     }
 
     Timer timer(TOTAL_ORDERS_EXPECTED);
@@ -118,7 +124,7 @@ int main() {
     Publisher mkt_publisher(mkt_data_queues, g_running);
     OrderManager<NUM_SHARDS> order_manager(drop_copy_queues, gw_reject_queues, tsc_queues, timer, g_running);
     order_manager.set_stats_region(stats);
-    TCPServer server(9091, num_gw, engine_queues, gw_reject_queues, pools);
+    TCPServer server(9091, num_gw, engine_queues, ack_queues, gw_reject_queues, pools);
 
     // Core assignments come from config.env (single config source, §6) so pinning
     // tracks the isolcpus map instead of drifting from it. Gateway workers already
