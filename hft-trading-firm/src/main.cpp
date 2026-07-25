@@ -13,7 +13,9 @@
 #endif
 #include "data/book_builder.h"
 #include "signal/signal_engine.h"
+#include "strategy/istrategy.h"
 #include "strategy/market_maker.h"
+#include "strategy/taker.h"
 #include "risk/risk_manager.h"
 #include "execution/execution_engine.h"
 #include "monitoring/firm_stats.h"
@@ -60,7 +62,29 @@ int main(int argc, char** argv) {
 
         auto book_builder = std::make_unique<BookBuilder>();
         SignalEngine signal_engine;
-        MarketMakerStrategy strategy;
+
+        // Strategy selection by STRATEGY env (maker default | taker). Params from
+        // env; defaults reproduce today's maker behavior.
+        auto env_u32 = [](const char* k, uint32_t d) {
+            const char* v = std::getenv(k);
+            return v ? static_cast<uint32_t>(std::strtoul(v, nullptr, 10)) : d;
+        };
+        auto env_f = [](const char* k, float d) {
+            const char* v = std::getenv(k);
+            return v ? std::strtof(v, nullptr) : d;
+        };
+        std::unique_ptr<IStrategy> strategy;
+        const char* strat_env = std::getenv("STRATEGY");
+        if (strat_env && std::string(strat_env) == "taker") {
+            strategy = std::make_unique<TakerStrategy>(
+                env_f("TAKER_THRESHOLD", 0.6f), env_u32("TAKER_SIZE", 100));
+            std::cout << "[System] Strategy: TAKER\n";
+        } else {
+            strategy = std::make_unique<MarketMakerStrategy>(
+                env_u32("MM_SPREAD", 2), env_f("MM_IMBALANCE", 0.6f), env_u32("MM_SIZE", 100));
+            std::cout << "[System] Strategy: MAKER\n";
+        }
+
         RiskManager risk_mgr;
         // Heap-allocated: its order_tracker is ~11MB (MAX_LIVE_ORDERS entries),
         // which overflows the 8MB thread stack if placed as a by-value local.
@@ -112,7 +136,7 @@ int main(int argc, char** argv) {
 
             // 3. Strategy Engine evaluates signals and generates intents
             outbound_actions.clear();
-            strategy.on_tick(tick, sig, outbound_actions);
+            strategy->on_tick(tick, sig, outbound_actions);
             uint64_t t4 = __rdtscp(&aux);
 
             // 4. Send intents through Risk to Execution Engine
