@@ -145,3 +145,54 @@ Four such timestamps ride on the wire in `OuchEnterOrder` (`t1_exchange_send` �
 ### Example Attribution
 
 The gateway maintains per-stage cycle accumulators (`total_read_cycles`, `total_decode_cycles`, `total_validation_cycles`, `total_enqueue_cycles`) exported in the shutdown stats and the `/dev/shm` region. Concrete per-stage figures are **`TODO(measure)`** — the capacity matrix has not been re-run on reference hardware since the Phase-0/1/3 fixes (see [`benchmarks.md`](./benchmarks.md)); the earlier hardcoded numbers were removed rather than carried forward unverified.
+
+---
+
+## 8. Private-Ack Egress & the Firm Seqlock Region
+
+### The Problem
+Two asymmetries had to be closed without disturbing the hot path. First, the exchange
+read orders but never wrote anything back, so a firm could not attribute its *own* fills
+(ITCH multicast is anonymous and carries `internal_id`, not the firm's `order_token`).
+Second, a client fd is owned by exactly one gateway worker — only that thread may write it
+— but fills are produced on engine threads, so a report cannot simply be written where it
+is generated.
+
+### The Implementation
+The egress **mirrors the ingress SPSC fabric exactly**. Ingress is
+`queues[shard][worker]`; egress adds `ack_queues[shard][worker]`, where engine shard `s`
+is the sole producer into `ack_queues[s][*]` and gateway worker `w` the sole consumer of
+`ack_queues[*][w]` — the same single-producer/single-consumer invariant the ingress
+already relies on (`gateway/tcp_server.h`, `app/exchange.cpp`). `Order` gained a
+`worker_id`, stamped at allocation from the owning worker; both sides of every fill route
+to their respective workers by that field. The queue element carries the routing key
+without touching the wire:
+```cpp
+struct OutboundAck {              // matching/order.h
+    OuchExecutionReport report;   // the 32-byte wire message, unchanged
+    uint32_t client_id;           // queue-internal: used to find the fd, never sent
+};
+```
+So the on-wire `OuchExecutionReport` stays exactly 32 bytes; `client_id` is metadata the
+consumer strips before writing. The worker drains its column after `epoll_wait` and writes
+non-blocking (`send` + `MSG_NOSIGNAL`); on a partial send or `EAGAIN` it buffers the
+remainder and arms `EPOLLOUT`, flushing on the next writable event and disarming when the
+buffer empties. A client that never reads and lets its out-buffer overflow is closed
+(back-pressure of last resort). This leaves `DropCopyMessage`, the audit-log format, and
+the entire Python monitoring layer **untouched** (see [`private-ack-plan.md`](./private-ack-plan.md)).
+
+### The Firm Seqlock Region
+The firm exposes its live state the same way the exchange does — a `/dev/shm` seqlock
+region, not a lock. `FirmStatsRegion` (`hft-trading-firm/src/monitoring/firm_stats.h`) is
+a near-copy of the exchange's `core/stats_region.h`: a sampled block guarded by an atomic
+`seq` (even = stable, odd = writer in progress). Exactly **one** writer — the market-data
+callback thread — publishes every ~100 ms (bumping `seq` odd, writing the block, bumping it
+even), so there is no cross-thread race and the firm's hot path is never blocked by a
+reader. Position and realized PnL are **ack-driven**: the firm's `tcp_rx_thread` applies
+each received `OuchExecutionReport` to `RiskManager`, and the md thread mirrors that plus
+the per-stage/connector cycle counters into the region. `firm_stats_reader.py` reads it
+under the same seqlock protocol (see [`firm-monitoring-plan.md`](./firm-monitoring-plan.md)).
+
+**Impact:** the exchange closes the private-ack loop, and every firm gets the exact
+observability surface the exchange already had — both with zero new locks and no change to
+the wire or audit formats.

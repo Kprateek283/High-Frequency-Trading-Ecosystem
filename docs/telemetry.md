@@ -80,3 +80,21 @@ Capturing cycle counts is fast, but logging them to `stdout` or writing them to 
 To ensure the telemetry pipeline never slows down the trading path, the system employs an asynchronous, off-path logging strategy. The core Matching Engine thread writes its `(ingress_tsc, match_tsc)` tuples into a dedicated lock-free SPSC queue. A dedicated background telemetry thread reads from this queue and aggregates statistics asynchronously.
 
 This guarantees that the application logic runs unencumbered. This telemetry infrastructure made it possible to attribute latency to specific subsystems and ultimately identify the Linux networking path as the dominant source of ingress overhead under sustained load.
+
+---
+
+## Firm-Side Telemetry
+
+The same discipline now runs on the **firm**. Each firm accumulates per-stage cycle
+attribution across its pipeline — BookBuilder, Signal, Strategy, Risk, Execution — plus
+its connector cycles (serialize / send / enqueue / dequeue). These were previously printed
+only to `stdout` at shutdown; they are now published **live** to a per-firm seqlock region
+at `/dev/shm/firm_stats_<FIRM_ID>` (single writer: the market-data thread, ~100 ms) and
+read by `monitoring/feeds/firm_stats_reader.py` into a per-firm TUI panel.
+
+Crucially, the firm's **position and realized PnL are now ack-driven**: they move on
+*confirmed* fills received via the private-ack channel (`OuchExecutionReport` on the firm's
+`tcp_rx_thread`, matched to the firm's own `order_token`), not on order *intent* as before.
+The pre-send figure becomes pending exposure (`in_flight`), so the panel shows true
+confirmed state rather than optimistic bookkeeping (see
+[`firm-monitoring-plan.md`](./firm-monitoring-plan.md)).
