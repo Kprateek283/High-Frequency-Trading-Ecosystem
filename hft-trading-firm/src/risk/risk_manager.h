@@ -15,8 +15,15 @@ private:
   const int32_t MAX_POSITION = 10000;
   const uint64_t MSG_RATE_LIMIT_PER_SEC = 5000;
 
-  // State
+  // State. Position is CONFIRMED (ack-driven): it only moves in on_fill, which
+  // is called from the execution report path. check_order below only READS it,
+  // so there is exactly one home for position and no intent/pre-send double count.
   std::array<int32_t, 1000> current_positions{0};
+  // Realized PnL as running fill cash-flow: sells add proceeds, buys subtract
+  // cost. Equals closed PnL whenever the position returns flat.
+  // ponytail: cash-flow proxy; switch to per-instrument average-cost if you need
+  // realized-vs-unrealized split while holding inventory.
+  int64_t realized_pnl_ = 0;
 
   // Rate Limiting State
   uint64_t msg_count_this_second = 0;
@@ -36,13 +43,26 @@ public:
     std::cout << "[RISK] KILL SWITCH ENGAGED! ALL OUTBOUND FLOW BLOCKED.\n";
   }
 
-  // Called when the firm gets an execution report from the exchange
-  inline void on_fill(uint16_t instrument_id, bool is_buy, uint32_t qty) {
+  // Called when the firm gets a CONFIRMED execution report from the exchange.
+  inline void on_fill(uint16_t instrument_id, bool is_buy, uint32_t qty,
+                      uint32_t price) {
+    int64_t notional = static_cast<int64_t>(price) * qty;
     if (is_buy) {
       current_positions[instrument_id] += qty;
+      realized_pnl_ -= notional;
     } else {
       current_positions[instrument_id] -= qty;
+      realized_pnl_ += notional;
     }
+  }
+
+  // Read accessors for monitoring (Stage 3 seqlock writer samples these).
+  inline int32_t position(uint16_t instrument_id) const {
+    return current_positions[instrument_id];
+  }
+  inline int64_t realized_pnl() const { return realized_pnl_; }
+  inline bool kill_switch_engaged() const {
+    return kill_switch.load(std::memory_order_acquire);
   }
 
   // O(1) Pre-Trade Risk Check. Returns true if the order is SAFE to send.
