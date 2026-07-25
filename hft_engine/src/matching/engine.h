@@ -24,7 +24,7 @@ public:
            LockFreeQueue<ItchMessage, 1048576>& mkt_data_queue,
            LockFreeQueue<DropCopyMessage, 1048576>& drop_copy_queue,
            std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>& engine_queues_for_shard,
-           std::vector<std::unique_ptr<LockFreeQueue<OuchExecutionReport, 524288>>>& ack_queues_for_shard,
+           std::vector<std::unique_ptr<LockFreeQueue<OutboundAck, 524288>>>& ack_queues_for_shard,
            LockFreeQueue<TscTuple, 1048576>& tsc_queue,
            std::atomic<bool>& running_flag);
 
@@ -34,7 +34,7 @@ private:
     std::array<Order*, MAX_ORDERS_LOOKUP> orders_by_id;
     std::array<OrderBook, MAX_INSTRUMENTS> books;
     std::vector<LockFreeQueue<EngineTask, 524288>*> queues; // one per gateway worker
-    std::vector<LockFreeQueue<OuchExecutionReport, 524288>*> ack_queues; // egress, one per gateway worker (Step 2 plumbing; produced in Step 3)
+    std::vector<LockFreeQueue<OutboundAck, 524288>*> ack_queues; // egress, one per gateway worker (Step 2 plumbing; produced in Step 3)
     LockFreeQueue<TscTuple, 1048576>& tsc_queue;
     std::atomic<bool>& running;
 };

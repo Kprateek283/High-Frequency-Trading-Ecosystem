@@ -74,6 +74,17 @@ inline uint64_t decode_order_token(const char* token) {
     return value;
 }
 
+// Inverse of decode_order_token: write `value` back into the 14-digit zero-padded
+// ASCII token field so an execution report echoes the client's own token
+// (private-ack §3). Round-trips: decode_order_token(encode) == value for any
+// token the gateway accepted (< 10^14).
+inline void encode_order_token(char* token, uint64_t value) {
+    for (int i = 13; i >= 0; --i) {
+        token[i] = static_cast<char>('0' + value % 10);
+        value /= 10;
+    }
+}
+
 // Writes the canonical 8-byte wire symbol for `inst`. Every client uses this
 // rather than a hand-rolled literal; that is the whole point of the pair.
 inline void encode_symbol(char* stock, uint16_t inst) {

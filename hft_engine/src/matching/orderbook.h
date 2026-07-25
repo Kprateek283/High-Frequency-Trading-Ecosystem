@@ -137,6 +137,10 @@ private:
     MemoryPool<Order>* pool = nullptr;
     LockFreeQueue<ItchMessage, 1048576>* mkt_data_queue = nullptr;
     LockFreeQueue<DropCopyMessage, 1048576>* drop_copy_queue = nullptr;
+    // Egress ack queues for this shard, one per gateway worker (private-ack §3).
+    // Points at the owning Engine's ack_queues vector; null in unit-test books
+    // that don't wire egress (they assert ITCH/drop-copy, not acks).
+    std::vector<LockFreeQueue<OutboundAck, 524288>*>* ack_queues = nullptr;
 
     inline void broadcast(char type, uint64_t internal_id, uint64_t price, uint32_t qty, uint16_t inst, char side) {
         // timestamp is (re)stamped at send time by the Publisher (that send time is
@@ -155,6 +159,27 @@ private:
         if (!drop_copy_queue->push(msg)) {
             g_stats.dropped_drop_copies.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+
+    // Private OUCH ack for one side of a fill, routed back to the gateway worker
+    // that owns this order's client fd (private-ack §3). The 32-byte report echoes
+    // the client's own order_token; client_id rides the queue so the worker can
+    // find the fd, and is never sent. liquidity_flag: 'R' removed (aggressor) /
+    // 'A' added-then-hit (resting).
+    // ponytail: drop-on-full (no spin). One slow client's worker queue must not
+    // stall the whole shard's matching; a lost private ack is recoverable, a
+    // stalled engine is not. Add a dropped_acks counter if the loss needs to show.
+    inline void send_ack(const Order* o, uint32_t exec_shares, uint32_t exec_price, char liquidity_flag) {
+        if (!ack_queues) return;   // unit-test book with no egress wired
+        OutboundAck ack;
+        ack.report.msg_type = 'E';
+        encode_order_token(ack.report.order_token, o->client_order_id);
+        ack.report.executed_shares = exec_shares;
+        ack.report.execution_price = exec_price;
+        ack.report.liquidity_flag = liquidity_flag;
+        std::memset(ack.report.match_number, 0, sizeof(ack.report.match_number));
+        ack.client_id = o->client_id;
+        (*ack_queues)[o->worker_id]->push(ack);
     }
 
     // Self-trade prevention (cancel-newest): the incoming order would execute
@@ -177,11 +202,13 @@ public:
         std::memset(asks_l2, 0, sizeof(asks_l2));
     }
 
-    void init(MemoryPool<Order>* p, LockFreeQueue<ItchMessage, 1048576>* q, LockFreeQueue<DropCopyMessage, 1048576>* dcq, Order** arr) {
+    void init(MemoryPool<Order>* p, LockFreeQueue<ItchMessage, 1048576>* q, LockFreeQueue<DropCopyMessage, 1048576>* dcq, Order** arr,
+              std::vector<LockFreeQueue<OutboundAck, 524288>*>* aq = nullptr) {
         pool = p;
         mkt_data_queue = q;
         drop_copy_queue = dcq;
         orders_by_id = arr;
+        ack_queues = aq;
     }
 
     ~OrderBook() {
@@ -249,6 +276,12 @@ public:
                     send_drop_copy(resting->client_order_id, resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side,
                                    resting->quantity > new_order->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
 
+                    // Private acks, both sides: aggressor removed liquidity ('R'),
+                    // resting order was added-then-hit ('A'). Each routes to its own
+                    // firm's worker via its own worker_id (private-ack §3).
+                    send_ack(new_order, match_qty, resting->price, 'R');
+                    send_ack(resting, match_qty, resting->price, 'A');
+
                     if (new_order->quantity >= resting->quantity) [[likely]] {
                         new_order->quantity -= resting->quantity;
                         orders_by_id[resting->internal_id] = nullptr;
@@ -302,6 +335,10 @@ public:
                                    new_order->quantity > resting->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
                     send_drop_copy(resting->client_order_id, resting->internal_id, resting->price, match_qty, resting->instrument_id, resting->side,
                                    resting->quantity > new_order->quantity ? OrderState::PARTIAL_FILL : OrderState::FILLED);
+
+                    // Private acks, both sides (private-ack §3): see the buy-side path above.
+                    send_ack(new_order, match_qty, resting->price, 'R');
+                    send_ack(resting, match_qty, resting->price, 'A');
 
                     if (new_order->quantity >= resting->quantity) [[likely]] {
                         new_order->quantity -= resting->quantity;

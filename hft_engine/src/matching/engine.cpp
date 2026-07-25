@@ -8,7 +8,7 @@
 Engine::Engine(uint16_t shard_id, MemoryPool<Order>& pool, LockFreeQueue<ItchMessage, 1048576>& mkt_data_queue,
                LockFreeQueue<DropCopyMessage, 1048576>& drop_copy_queue,
                std::vector<std::unique_ptr<LockFreeQueue<EngineTask, 524288>>>& engine_queues_for_shard,
-               std::vector<std::unique_ptr<LockFreeQueue<OuchExecutionReport, 524288>>>& ack_queues_for_shard,
+               std::vector<std::unique_ptr<LockFreeQueue<OutboundAck, 524288>>>& ack_queues_for_shard,
                LockFreeQueue<TscTuple, 1048576>& tsc_q, std::atomic<bool>& running_flag)
     : tsc_queue(tsc_q), running(running_flag) {
 
@@ -25,7 +25,7 @@ Engine::Engine(uint16_t shard_id, MemoryPool<Order>& pool, LockFreeQueue<ItchMes
     }
 
     for (uint16_t i = shard_id; i < MAX_INSTRUMENTS; i += 4) {
-        books[i].init(&pool, &mkt_data_queue, &drop_copy_queue, orders_by_id.data());
+        books[i].init(&pool, &mkt_data_queue, &drop_copy_queue, orders_by_id.data(), &ack_queues);
     }
 }
 

@@ -66,6 +66,14 @@ struct alignas(32) DropCopyMessage {
     Side side;
 };
 
+// Queue-internal egress envelope (private-ack §2/§4): the 32-byte wire report the
+// gateway writes to the socket, plus the client_id the owning worker needs to look
+// up the fd. client_id is NEVER sent — it stays inside the ack queue.
+struct OutboundAck {
+    OuchExecutionReport report;
+    uint32_t client_id;
+};
+
 // Global statistics for monitoring health without slowing down the engine
 struct EngineStats {
     std::atomic<uint64_t> dropped_reports{0};
