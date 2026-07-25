@@ -1,6 +1,6 @@
 # System Architecture — CLI Diagram (multi-firm + private-ack loop)
 
-The current architecture on `feat/private-ack-exchange`: **N genuinely-different
+The current architecture (on `main`): **N genuinely-different
 trading firms** competing on one exchange, a **private OUCH ack loop** (the
 exchange writes execution reports back on each firm's TCP session), **ack-driven
 per-firm position/PnL**, and **per-firm monitoring** the Python TUI reads alongside
@@ -11,7 +11,7 @@ press `a`).
 
 **Three tiers, one closed loop.** N `trading_firm` processes (all the *same*
 `LocalExchangeConnector`, made distinct only by env) send OUCH orders to the
-exchange; the exchange matches them and — new on this branch — writes an
+exchange; the exchange matches them and — the new closed loop — writes an
 `OuchExecutionReport` back on each firm's own socket; each firm applies its
 confirmed fills to an ack-driven position/PnL and publishes them to a per-firm
 `/dev/shm/firm_stats_<FIRM_ID>` seqlock region; the Python monitor reads every
@@ -103,10 +103,14 @@ clear next increment.
    orders/firm, fills log "unknown Order ID". Long runs need slot reclaim/wrap.
 
 **Integration / operational**
-4. **Ack channel drops non-reading clients.** Close-on-overflow disconnects any
-   client that never reads its acks (the `liquidity`/`tester` tools). So
-   `run_sharding.sh` / `multi_firm_demo.sh` break against an ack-enabled build —
-   which is why this work stays on a branch, unmerged from `main`.
+4. **Ack channel can drop sustained non-reading clients.** Close-on-overflow
+   disconnects a client that never reads its acks *and* lets its 64KB out-buffer
+   fill (the `liquidity`/`tester` tools don't read acks). In practice
+   `run_sharding.sh` still produces correct results — matches are recorded in the
+   audit log independently of ack delivery, and this box's socket buffers absorb
+   the backflow before overflow (verified: 20000 fills, 0 drops). But a long/heavy
+   non-reading client on a small-buffer box could be disconnected mid-run; it
+   truncates *that client's* session, it does not corrupt matched/recorded results.
 5. **Token partition is a convention, not cross-firm enforced.** Each firm
    validates its own slice fits under `MAX_CLIENT_ORDERS`, but nothing stops two
    firms being launched with the same `TOKEN_BASE`; correct non-overlapping
