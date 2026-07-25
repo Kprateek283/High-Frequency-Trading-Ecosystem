@@ -6,7 +6,9 @@
 #include <memory>
 #include <string>
 #include "network/LocalExchangeConnector.h"
-#include "network/CryptoPaperConnector.h"
+#ifdef WITH_CRYPTO
+#include "network/CryptoPaperConnector.h"   // needs simdjson/curl/OpenSSL; opt-in via -DWITH_CRYPTO
+#endif
 #include "data/book_builder.h"
 #include "signal/signal_engine.h"
 #include "strategy/market_maker.h"
@@ -35,8 +37,13 @@ int main(int argc, char** argv) {
         connector = std::make_unique<LocalExchangeConnector>();
         std::cout << "[System] Using Local Exchange Simulator Connector.\n";
     } else if (venue == "crypto") {
+#ifdef WITH_CRYPTO
         connector = std::make_unique<CryptoPaperConnector>();
         std::cout << "[System] Using Crypto Paper Trading Connector.\n";
+#else
+        std::cerr << "[Error] Crypto venue not compiled in. Rebuild with -DWITH_CRYPTO=ON.\n";
+        return 1;
+#endif
     } else {
         std::cerr << "[Error] Unknown venue type: " << venue << "\n";
         return 1;
