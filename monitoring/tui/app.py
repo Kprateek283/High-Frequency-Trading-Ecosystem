@@ -22,6 +22,7 @@ from rich.table import Table
 from ..config import Config
 from ..clock import Clock
 from ..feeds.stats_reader import StatsReader
+from ..feeds import firm_stats_reader
 from ..feeds.audit_reader import AuditReader
 from ..feeds.multicast import MulticastReader
 from ..core import metrics
@@ -107,6 +108,7 @@ class Dashboard:
         self.audit = None
         self.mcast = None
         self.feed = None          # _BookFeed once open_feeds() runs
+        self.firm_readers = []    # one per /dev/shm/firm_stats_* region
         self.books = BookSet()    # used only when there is no live feed (tests)
         self.tape = deque(maxlen=tape_size)
         self.prev_snap = None
@@ -128,6 +130,12 @@ class Dashboard:
             self.feed = _BookFeed(self.mcast).start()
         except OSError:
             self.mcast = None
+        # One reader per firm region present; each firm publishes its own.
+        for p in firm_stats_reader.discover():
+            try:
+                self.firm_readers.append(firm_stats_reader.FirmStatsReader(p))
+            except OSError:
+                pass
 
     def _poll(self):
         snap = self.stats.read() if self.stats else None
@@ -187,6 +195,32 @@ class Dashboard:
             t.add_row(str(inst), str(bid), str(ask))
         return Panel(t, title="Top of book (ITCH)")
 
+    def _firm_snaps(self):
+        """(firm_id, snapshot|None) for every discovered firm region."""
+        out = []
+        for r in self.firm_readers:
+            try:
+                out.append((r.firm_id, r.read()))
+            except (OSError, ValueError):
+                out.append((r.firm_id, None))
+        return out
+
+    def _firm_panel(self, firm_snaps):
+        t = Table(expand=True)
+        for col in ("firm", "position", "realized_pnl", "sent", "acked",
+                    "in_flight", "strat_cyc/t", "kill"):
+            t.add_column(col, justify="right")
+        for fid, s in firm_snaps:
+            if not s or not s.valid():
+                t.add_row(fid, "—", "—", "—", "—", "—", "—", "—")
+                continue
+            pos = ", ".join(f"{i}:{p:+}" for i, p in list(s.positions.items())[:4]) or "flat"
+            spt = (s.cycles["strategy"] // s.ticks) if s.ticks else 0
+            t.add_row(fid, pos, f"{s.realized_pnl:,}", f"{s.orders_sent}",
+                      f"{s.orders_acked}", f"{s.in_flight}", f"{spt:,}",
+                      "[red]ON[/]" if s.kill_switch else "off")
+        return Panel(t, title="Per-firm (firm_stats)")
+
     def _liveness_line(self, snap):
         if not snap:
             return "[yellow]waiting for stats region…[/]"
@@ -199,10 +233,16 @@ class Dashboard:
         return f"[{colour}]● {verdict['overall']}[/]  heartbeat {age_ms:.0f}ms{why}"
 
     def render(self, snap):
-        if not snap:
+        parts = []
+        if snap:
+            parts += [self._liveness_line(snap), self._health_panel(snap),
+                      self._book_panel(), self._tape_panel()]
+        firm_snaps = self._firm_snaps()
+        if firm_snaps:
+            parts.append(self._firm_panel(firm_snaps))
+        if not parts:
             return Panel("[yellow]No stats region — is the engine running?[/]", title="HFT monitor")
-        return Group(self._liveness_line(snap), self._health_panel(snap),
-                     self._book_panel(), self._tape_panel())
+        return Group(*parts)
 
     def frame(self):
         """Poll every feed once and return one renderable (used by run() and tests)."""
@@ -222,7 +262,7 @@ class Dashboard:
     def close(self):
         if self.feed:
             self.feed.stop()          # stop reading before the socket goes away
-        for r in (self.stats, self.audit, self.mcast):
+        for r in (self.stats, self.audit, self.mcast, *self.firm_readers):
             if r:
                 r.close()
 
@@ -245,6 +285,22 @@ def _render_once_headless():
     snap = StatsSnapshot(buf)
     d.books.apply(wire.ItchMessage("A", 0, 0, 0, 1, 100, 50000, "B"))
     d.tape.appendleft(wire.decode_audit_entry(_fake_entry()))
+    # synthetic firm region → one FirmStatsSnapshot behind a fake reader, so
+    # render() also builds the per-firm panel.
+    fbuf = bytearray(firm_stats_reader.FIRM_STATS_REGION_SIZE)
+    struct.pack_into("<II", fbuf, firm_stats_reader.OFF_MAGIC,
+                     firm_stats_reader.FIRM_STATS_MAGIC, firm_stats_reader.PROTOCOL_VERSION)
+    struct.pack_into("<I", fbuf, firm_stats_reader.OFF_SEQ, 2)
+    struct.pack_into(firm_stats_reader.SCALARS_FMT, fbuf, firm_stats_reader.OFF_SCALARS,
+                     -1500, 10, 7, 3, 42, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+    struct.pack_into("<q", fbuf, firm_stats_reader.OFF_POSITION + 5 * 8, 250)
+    fsnap = firm_stats_reader.FirmStatsSnapshot(fbuf)
+
+    class _FakeFirmReader:
+        firm_id = "HFT1"
+        def read(self):
+            return fsnap
+    d.firm_readers = [_FakeFirmReader()]
     console = Console(file=open("/dev/null", "w"), force_terminal=False)
     console.print(d.render(snap))     # must not raise
     return True

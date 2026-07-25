@@ -1,6 +1,16 @@
 #pragma once
+#include <cstdint>
 #include <functional>
 #include "models/NormalizedModels.h"
+
+// Connector-side cumulative counters the firm monitor samples (firm-monitoring-plan).
+struct ConnectorStats {
+    uint64_t orders_sent = 0;
+    uint64_t serialize_cycles = 0;
+    uint64_t send_cycles = 0;
+    uint64_t enqueue_cycles = 0;
+    uint64_t dequeue_cycles = 0;
+};
 
 class IExchangeConnector {
 public:
@@ -8,6 +18,9 @@ public:
 
     // Connects to the venue (TCP/Websockets/REST)
     virtual bool initialize() = 0;
+
+    // Snapshot of the connector's cumulative counters for monitoring.
+    virtual ConnectorStats stats() const = 0;
 
     // Starts pumping normalized ticks into our Brain
     using TickCallback = std::function<void(const NormalizedTick&)>;

@@ -58,6 +58,14 @@ public:
         exec_callback = on_fill;
     }
 
+    ConnectorStats stats() const override {
+        return { total_orders_sent.load(std::memory_order_relaxed),
+                 total_serialize_cycles.load(std::memory_order_relaxed),
+                 total_send_cycles.load(std::memory_order_relaxed),
+                 total_enqueue_cycles.load(std::memory_order_relaxed),
+                 total_dequeue_cycles.load(std::memory_order_relaxed) };
+    }
+
     int tcp_mode = 2;
     int num_connections = 1;
     std::vector<std::unique_ptr<TCPClient>> tcp_clients;

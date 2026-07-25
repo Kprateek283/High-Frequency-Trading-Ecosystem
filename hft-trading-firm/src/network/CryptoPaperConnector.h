@@ -44,6 +44,8 @@ public:
         exec_callback = on_fill;
     }
 
+    ConnectorStats stats() const override { return {}; }  // paper venue: no cycle counters
+
     bool initialize() override {
         curl_global_init(CURL_GLOBAL_ALL);
         std::cout << "[CryptoConnector] Connecting to Binance Testnet WSS via Boost.Beast...\n";
