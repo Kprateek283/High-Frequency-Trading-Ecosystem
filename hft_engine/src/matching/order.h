@@ -38,12 +38,13 @@ struct alignas(64) Order {
 // Padded/Aligned to 32 bytes to ensure it cleanly fits in cache lines in LockFreeQueue
 struct alignas(32) EngineTask {
     MsgType type;
+    struct CancelData {
+        uint64_t internal_id;      // pool slot handle of the resting order
+        uint64_t client_order_id;  // validated against the slot's current owner
+    };
     union {
         Order* order;          // Used for MsgType::NEW
-        struct {
-            uint64_t internal_id;      // pool slot handle of the resting order
-            uint64_t client_order_id;  // validated against the slot's current owner
-        } cancel;                      // Used for MsgType::CANCEL
+        CancelData cancel;     // Used for MsgType::CANCEL
     };
     uint64_t ingress_tsc;
 };
@@ -78,6 +79,9 @@ struct OutboundAck {
 struct EngineStats {
     std::atomic<uint64_t> dropped_reports{0};
     std::atomic<uint64_t> dropped_drop_copies{0};
+    alignas(64) std::atomic<uint64_t> engine_orders_in[8];
+    alignas(64) std::atomic<uint64_t> engine_polls_idle[8];
+    alignas(64) std::atomic<uint64_t> engine_polls_active[8];
 };
 
 extern EngineStats g_stats;
