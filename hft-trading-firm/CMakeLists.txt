@@ -16,6 +16,13 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address")
 # Threading library
 find_package(Threads REQUIRED)
 
+# book_builder.h includes <boost/container/flat_map.hpp>. Header-only, but it was
+# previously undeclared -- the build simply assumed Boost sat on the default
+# include path, so it compiled on developer machines and died mid-compile with a
+# bare "No such file or directory" anywhere else. Declaring it fails at configure
+# time with an actionable message instead.
+find_package(Boost REQUIRED)
+
 # Include Directories
 include_directories(src)
 include_directories(include)
@@ -35,7 +42,7 @@ add_executable(trading_firm src/main.cpp)
 
 target_compile_options(trading_firm PRIVATE -Wall -Wextra -Werror -Wpedantic)
 
-target_link_libraries(trading_firm PRIVATE Threads::Threads)
+target_link_libraries(trading_firm PRIVATE Threads::Threads Boost::headers)
 
 if(WITH_CRYPTO)
     include(FetchContent)

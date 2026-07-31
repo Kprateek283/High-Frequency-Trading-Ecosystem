@@ -21,6 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # hft-trading-firm's book_builder.h needs header-only Boost. Only the
+      # Release leg builds that tree, but installing unconditionally keeps the
+      # matrix uniform and costs a few seconds.
+      - name: Install Boost headers
+        run: sudo apt-get update && sudo apt-get install -y libboost-dev
+
       - name: Configure
         # -march=native is in CMAKE_CXX_FLAGS_RELEASE; build and test run on the
         # same runner, so it is safe here.
