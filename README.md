@@ -3,7 +3,7 @@
 ## 1. Project Overview
 A cycle-accurate High-Frequency Trading (HFT) ecosystem built in modern C++ to explore the performance limits of POSIX userspace networking without kernel-bypass technologies such as DPDK.
 
-The project models both sides of a trading venue: a Trading Firm Simulator capable of generating 10M+ messages/sec and an Exchange comprising a sharded TCP Gateway, lock-free ingestion pipeline, Pre-Trade Risk Engine, and deterministic Price-Time Priority Matching Engine.
+The project models both sides of a trading venue: a Trading Firm Simulator and an Exchange comprising a sharded TCP Gateway, lock-free ingestion pipeline, Pre-Trade Risk Engine, and deterministic Price-Time Priority Matching Engine.
 
 ## 2. Key Results
 | Metric | Result |
@@ -11,19 +11,42 @@ The project models both sides of a trading venue: a Trading Firm Simulator capab
 | **Functional run** | 4-thread gateway matches orders end-to-end: 10,000 orders → 20,000 fills, **0 rejects** (`results.txt`) |
 | **Gateway Architecture** | 4-thread `SO_REUSEPORT` sharding |
 | **Latency probes** | 5-point `__rdtscp` decomposition (4 on-wire + gateway ingress) |
-| **Gateway ingest** | **~1.08M orders/sec** at 4 workers × 4 concurrent clients; scales 215k → 587k → 1.08M as clients are added (`benchmark_results.txt`) |
-| **Gateway Ingest Path** | Decode **~82**, Validate **~24**, Enqueue **~340** cycles/order (ingest path only, *not* the matching engine) |
+| **Gateway ingest** | **1.68M orders/sec** (median of 9 runs, spread 52.7%) at 4 workers × 4 concurrent clients; scales 533k → 1.19M → 1.68M as clients are added (`benchmark_results.txt`) |
+| **Gateway Ingest Path** | `epoll_wait` **~54**, `read` **~117**, Decode **~162**, Validate **~53**, Enqueue **~536** (Allocate **~166**, Record **~47**, Push **~229**), Egress drain **~18** — **~946 cycles/order** total (ingest path only, *not* the matching engine) |
 | **End-to-End Latency** | `TODO(measure)` — needs a box where `SCHED_FIFO` is grantable; see below |
 
 > **Read the throughput number with its caveat.** It was measured by
 > [`scripts/measure_throughput.py`](./scripts/measure_throughput.py), which samples
-> `orders_in` from the stats region rather than trusting a client's send rate (a
-> `send()` returns once buffered, so client-side "throughput" is offered load, not
-> work done). It is a **lower bound from a developer desktop**: no `SCHED_FIFO`
-> privilege, a `powersave` governor, and other applications running. The *shape* —
-> that ingest scales with concurrent connections and saturates near 4 — is the
-> meaningful result; the ceiling will be higher on isolated hardware. Re-run the
-> script there to replace it.
+> `engine_orders_in` from the stats region rather than trusting a client's send rate
+> (a `send()` returns once buffered, so client-side "throughput" is offered load, not
+> work done). The counter matters: an earlier version of this benchmark read
+> `orders_in`, which is incremented by the OrderManager **three hops downstream** of
+> the engine and silently undercounts whenever the drop-copy queue overflows. It was
+> measuring the audit logger, not the exchange. `engine_orders_in` is incremented by
+> the matching engine itself, on its own cache line, per shard.
+>
+> **This ceiling is the load generator, not the exchange.** At the 1.68M operating
+> point the gateway is **~48% idle** and the engine shards are **~89% idle** — both
+> sit in their empty-poll branches waiting for work. Firm and exchange share one
+> laptop; the exchange is pinned to the P-cores (`EXCHANGE_CPUSET`, default `0-7`),
+> so the `tester` processes run on E-cores and cannot produce TCP traffic fast enough
+> to saturate a gateway that costs ~950 cycles/order. Ingest was still climbing at
+> four clients — it has not saturated, and the number is a floor for this box, not a
+> ceiling for the design. The 1→2 client spreads (12.9% / 7.2%) are tight; the
+> 4-client spread is 52.7%, so treat 1.68M as "clearly above 1.19M" rather than as a
+> precise figure.
+>
+> **Per-order cycle counts are bimodal on this box, and it is SMT.** Across the nine
+> runs at 4×4, `Total/Order` splits into two clusters — five runs at 742–1056 and
+> three at 1601–1861 — while the calibrated TSC stays at 2.11 cycles/ns throughout.
+> A constant TSC means those are real extra cycles, not the governor. Re-pinning to
+> one thread per physical P-core (`EXCHANGE_CPUSET=0,2,4,6`) removes the high cluster
+> (median 946 → 697 cycles/order, max 1097), which points at gateway workers landing
+> on SMT siblings of the same physical core. It is **not** a free win: the same
+> change halves single-client throughput (533k → 252k) and costs 21% at two clients,
+> because four logical CPUs cannot host the exchange's ~10 threads. Per-order
+> efficiency and wall-clock throughput move in opposite directions, so `0-7` stays
+> the published configuration and the trade-off is recorded rather than resolved.
 >
 > **Latency percentiles are deliberately still unmeasured.** Tail latency is
 > precisely what arbitrary preemption destroys, and this box cannot grant
@@ -38,7 +61,7 @@ The project models both sides of a trading venue: a Trading Firm Simulator capab
 >
 > **Why ingest needs concurrent clients:** `SO_REUSEPORT` distributes accepted
 > *connections* across workers, so a single-socket client pins all load to one
-> worker regardless of `GATEWAY_THREADS` — measured 215k orders/s at both 1 and 4
+> worker regardless of `GATEWAY_THREADS` — measured 533k orders/s at 4
 > workers with one client. Load generators must open multiple connections.
 
 ## 3. Architecture
