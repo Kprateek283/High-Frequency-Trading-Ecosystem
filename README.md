@@ -233,7 +233,7 @@ The harness is complete and needs no code changes — only a box configured for
 deterministic execution. Set the three OS prerequisites once
 ([`docs/benchmark-setup.md`](./docs/benchmark-setup.md)):
 
-1. **`SCHED_FIFO`** — `ulimit -r unlimited` (else real-time pinning silently degrades).
+1. **`SCHED_FIFO`** — install `scripts/99-hft-realtime.conf` into `/etc/security/limits.d/` and re-login (`ulimit -r` cannot raise its own hard limit). Else real-time pinning silently degrades; the exchange prints `RT_SCHED: granted=N/M` so you can tell.
 2. **`performance` governor** — `sudo cpupower frequency-set -g performance`.
 3. **`isolcpus`** — isolate the engine's cores (1–8, per `config.env`) via GRUB + reboot.
 

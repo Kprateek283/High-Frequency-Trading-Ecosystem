@@ -41,6 +41,7 @@ WINDOW_S = 1.5
 # Which CPUs the exchange is pinned to. "0-7" is the four P-cores *including*
 # their SMT siblings; "0,2,4,6" is one thread per physical P-core.
 CPUSET = os.environ.get("EXCHANGE_CPUSET", "0-7")
+RT_STATUS = []            # one "RT_SCHED: granted=N/M priority=P" per run
 
 
 def _read(path, default="n/a"):
@@ -73,9 +74,17 @@ def one_run(workers, clients):
                AUDIT_LOG_PATH="/dev/shm/measure_audit.log")
     eng = subprocess.Popen(["taskset", "-c", CPUSET, f"{BIN}/exchange"], cwd=ROOT, env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    rt_line = "RT_SCHED: not reported"
     for line in eng.stdout:                                 # the I8 READY barrier
+        if line.startswith("RT_SCHED:"):
+            # What the exchange actually got, not what `ulimit -r` promised. The
+            # exchange's stderr goes to /dev/null, so before this existed a run
+            # whose threads all failed to reach SCHED_FIFO looked identical to
+            # one where they succeeded.
+            rt_line = line.strip()
         if line.strip() == "READY":
             break
+    RT_STATUS.append(rt_line)
 
     reader = StatsReader(Config().get_path("STATS_SHM_PATH"))
     procs = [subprocess.Popen([f"{BIN}/tester"], cwd=ROOT,
@@ -114,6 +123,7 @@ def main():
              f"# cores={env['cores']} load1={env['load_1min']:.2f} "
              f"governor={env['governor']} rtprio_limit={env['rtprio_limit']} "
              f"isolcpus={env['isolcpus']} exchange_cpuset={env['cpuset']}",
+             "# realtime: PENDING",      # filled in after the sweep, from the runs
              "# orders/s measured from stats-region engine_orders_in (incremented by "
              "the matching engine itself, not the downstream OrderManager) over a "
              f"{WINDOW_S}s window, {RUNS} runs per point (median reported)",
@@ -128,6 +138,13 @@ def main():
         row = f"{workers:9d}  {clients:7d}  {median:19.0f}  {spread:9.1f}"
         print(row)
         lines.append(row)
+
+    # What the exchange actually achieved, not what ulimit promised. If any run
+    # differed, say so rather than reporting one of them.
+    seen = sorted(set(RT_STATUS))
+    lines[lines.index("# realtime: PENDING")] = (
+        "# realtime (achieved by the exchange, not promised by ulimit): "
+        + (" | ".join(seen) if seen else "n/a"))
 
     if env["rtprio_limit"] == 0 or env["governor"] not in ("performance",):
         lines += ["#",

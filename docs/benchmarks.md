@@ -133,7 +133,7 @@ for gt in 1 2 4 8; do GATEWAY_THREADS=$gt ./scripts/run_sharding.sh; done   # ->
 python3 scripts/measure_throughput.py                                       # -> benchmark_results.txt
 ```
 
-On a box that grants `SCHED_FIFO` (`ulimit -r unlimited`), pins to isolated cores
+On a box that grants `SCHED_FIFO` (via `/etc/security/limits.d/`, see setup), pins to isolated cores
 (`isolcpus=`), and uses the `performance` governor, these same two commands turn the
 lower bounds above into the publishable matrix. No code change required — the exact
 setup steps and how to verify each are in

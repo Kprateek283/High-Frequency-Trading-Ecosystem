@@ -17,6 +17,7 @@
 #include <cstdio>
 #include "matching/engine.h"
 #include "core/timer.h"
+#include "core/realtime.h"
 #include "core/stats_region.h"
 #include "core/memory_pool.h"
 #include "core/lock_free_queue.h"
@@ -52,11 +53,7 @@ void set_realtime_priority(int core_id) {
     CPU_SET(core_id, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 
-    struct sched_param param;
-    param.sched_priority = 99; 
-    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
-        std::cerr << "Warning: Could not set SCHED_FIFO." << std::endl;
-    }
+    rt::acquire();      // counted; reported on stdout at READY and at shutdown
 }
 
 
@@ -178,6 +175,7 @@ int main() {
         std::fclose(pf);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    rt::report(std::cout);      // before READY: the harness records it per run
     std::cout << "READY" << std::endl;
 
     // 4. Wait for shutdown; meanwhile sample the stats region every ~100ms. This
@@ -253,6 +251,7 @@ int main() {
     uint64_t total_polls = total_idle_polls + total_active_polls;
     double engine_idle_ratio = (total_polls > 0) ? (static_cast<double>(total_idle_polls) / total_polls * 100.0) : 0.0;
     std::cout << "Engine Idle Ratio : " << engine_idle_ratio << "%\n";
+    rt::report(std::cout);
 
     std::cout << "Engine Halted." << std::endl;
 
