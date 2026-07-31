@@ -22,6 +22,8 @@ void test_orderbook();
 void test_framing();
 void test_identity();
 void test_pool();
+void test_pool_concurrency();
+void test_pool_recycle_concurrency();
 
 #define CHECK(cond)                                                            \
     do {                                                                       \
@@ -39,3 +41,4 @@ void test_pool();
         fn();                                                                  \
         std::printf("ok\n");                                                   \
     } while (0)
+void test_ack_coalescing();
