@@ -62,8 +62,9 @@ def decode_audit_entry(buf, off=0):
 # --- Stats region (I4/I5): HftStatsRegion in /dev/shm ---
 STATS_MAGIC = 0x48465431              # "HFT1"
 STATS_MAX_SHARDS = 8
-STATS_REGION_SIZE = 640
-SHARD_STATS_OFF = 128
+STATS_REGION_SIZE = 768
+SHARD_STATS_OFF = 256
+OFF_ENGINE_ORDERS_IN = 192
 SHARD_STATS_SIZE = 64
 # scalar field offsets (see stats_region.h; confirmed by C++ offsetof)
 OFF_MAGIC = 0
@@ -79,11 +80,14 @@ ANCHOR_FMT = "<QQd"
 SHARD_FMT = "<QQQQQQQQ"    # orders_in fills cancels rejects engine_q dropcopy_q mktdata_q pool_hw
 ShardStats = namedtuple(
     "ShardStats", "orders_in fills cancels rejects engine_q_depth "
-                  "dropcopy_q_depth mktdata_q_depth pool_high_water")
+                  "dropcopy_q_depth mktdata_q_depth pool_high_water "
+                  "engine_orders_in")
 
 def decode_shard(buf, i):
     off = SHARD_STATS_OFF + i * SHARD_STATS_SIZE
-    return ShardStats(*struct.unpack_from(SHARD_FMT, buf, off))
+    stats = struct.unpack_from(SHARD_FMT, buf, off)
+    eng_in = struct.unpack_from("<Q", buf, OFF_ENGINE_ORDERS_IN + i * 8)[0]
+    return ShardStats(*stats, eng_in)
 
 
 def _selftest():

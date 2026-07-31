@@ -9,6 +9,7 @@
 #include <chrono>
 #include <thread>
 #include "protocol/messages.h"
+#include <atomic>
 
 int main() {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -24,6 +25,15 @@ int main() {
 
     int nodelay = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    std::atomic<bool> running{true};
+    std::thread reader_thread([&]() {
+        char buf[8192];
+        while (running) {
+            ssize_t n = recv(sock, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+        }
+    });
 
     const int TOTAL_ORDERS = 1000000;
     std::vector<OuchEnterOrder> orders(TOTAL_ORDERS);
@@ -92,12 +102,12 @@ int main() {
     }
 
     const char* rate_env = std::getenv("TARGET_RATE");
-    double target_rate = rate_env ? std::atof(rate_env) : 1000000.0;
+    double target_rate = rate_env ? std::atof(rate_env) : 0.0;
 
     std::cout << "C++ Tester: Sending 1M NEW orders at " << target_rate << " msgs/sec..." << std::endl;
     auto start = std::chrono::high_resolution_clock::now();
 
-    const size_t BATCH = 100;
+    const size_t BATCH = 2000;
     for (int i = 0; i < TOTAL_ORDERS; i += BATCH) {
         send(sock, &orders[i], BATCH * sizeof(OuchEnterOrder), 0);
         
@@ -136,6 +146,9 @@ int main() {
     }
     std::cout << "Cleanup complete." << std::endl;
 
+    running = false;
+    shutdown(sock, SHUT_RDWR);
+    if (reader_thread.joinable()) reader_thread.join();
     close(sock);
     return 0;
 }

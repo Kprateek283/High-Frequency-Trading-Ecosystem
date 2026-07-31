@@ -1,4 +1,7 @@
-build/
+# Any build tree, at any depth: build/, build-eng/, build-firm/, build-tsan/,
+# hft_engine/build_tsan/. Only `build/` was covered before, so the sanitizer and
+# split-tree build dirs were untracked *and* unignored.
+build*/
 *.log
 *.bin
 .vscode/
@@ -15,3 +18,10 @@ order_audit.log
 
 # Personal notes that live in the tree but must never be published
 project_assessment*
+docs/project-summary-resume.md
+
+# Interview-prep tooling that happens to live in this tree; unrelated to the
+# project and must never reach the public remote.
+study_tracker.py
+.study_progress.json
+tree.txt

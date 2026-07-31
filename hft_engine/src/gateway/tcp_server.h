@@ -150,7 +150,14 @@ public:
     std::atomic<uint64_t> total_decode_cycles{0};
     std::atomic<uint64_t> total_validation_cycles{0};
     std::atomic<uint64_t> total_enqueue_cycles{0};
+    std::atomic<uint64_t> total_allocate_cycles{0};
+    std::atomic<uint64_t> total_record_cycles{0};
+    std::atomic<uint64_t> total_push_cycles{0};
     std::atomic<uint64_t> total_orders_processed{0};
+    std::atomic<uint64_t> total_worker_cycles{0};
+    std::atomic<uint64_t> total_epoll_idle_cycles{0};
+    std::atomic<uint64_t> total_drain_cycles{0};
+    std::atomic<uint64_t> total_acks_processed{0};
 
     // End-to-end/TCP latency percentiles (the averages above hide the tail the
     // whole queueing-delay story is about). Reuses Timer, which already sorts a
@@ -189,8 +196,13 @@ public:
             std::cout << "read()       : " << (total_read_cycles.load() / orders) << " cycles/order\n";
             std::cout << "Decode       : " << (total_decode_cycles.load() / orders) << " cycles/order\n";
             std::cout << "Validation   : " << (total_validation_cycles.load() / orders) << " cycles/order\n";
-            std::cout << "Enqueue      : " << (total_enqueue_cycles.load() / orders) << " cycles/order\n";
-            std::cout << "Total/Order  : " << ((total_epoll_cycles.load() + total_read_cycles.load() + total_decode_cycles.load() + total_validation_cycles.load() + total_enqueue_cycles.load()) / orders) << " cycles/order\n";
+            std::cout << "Enqueue (Sum): " << (total_enqueue_cycles.load() / orders) << " cycles/order\n";
+            std::cout << "  - Allocate : " << (total_allocate_cycles.load() / orders) << " cycles/order\n";
+            std::cout << "  - Record   : " << (total_record_cycles.load() / orders) << " cycles/order\n";
+            std::cout << "  - Push     : " << (total_push_cycles.load() / orders) << " cycles/order\n";
+            std::cout << "Egress Drain : " << (total_drain_cycles.load() / orders) << " cycles/order\n";
+            std::cout << "Total/Order  : " << ((total_epoll_cycles.load() + total_read_cycles.load() + total_decode_cycles.load() + total_validation_cycles.load() + total_enqueue_cycles.load() + total_drain_cycles.load()) / orders) << " cycles/order\n";
+            std::cout << "Gateway Idle Ratio: " << (double)total_epoll_idle_cycles.load() / total_worker_cycles.load() * 100.0 << "%\n";
             std::cout << "Calibrated TSC: " << e2e_timer.cycles_per_ns_value() << " cycles/ns\n";
             std::cout << "========================================\n";
         }
@@ -219,11 +231,14 @@ public:
         struct epoll_event events[64];
         while (running.load(std::memory_order_relaxed)) {
             unsigned aux;
-            uint64_t e1 = __rdtscp(&aux);
+            uint64_t w1 = __rdtscp(&aux);
+            uint64_t e1 = w1;
             int nfds = epoll_wait(e_fd, events, 64, 100);
             uint64_t e2 = __rdtscp(&aux);
             if (nfds > 0) {
                 total_epoll_cycles.fetch_add(e2 - e1, std::memory_order_relaxed);
+            } else {
+                total_epoll_idle_cycles.fetch_add(e2 - e1, std::memory_order_relaxed);
             }
             
             for (int i = 0; i < nfds; ++i) {
@@ -269,7 +284,13 @@ public:
 
             // After servicing this batch, push out every private ack the engines
             // produced for this worker's clients.
+            uint64_t dr1 = __rdtscp(&aux);
             drain_acks(thread_id, client_states, fd_by_client, e_fd);
+            uint64_t dr2 = __rdtscp(&aux);
+            total_drain_cycles.fetch_add(dr2 - dr1, std::memory_order_relaxed);
+            
+            uint64_t w2 = __rdtscp(&aux);
+            total_worker_cycles.fetch_add(w2 - w1, std::memory_order_relaxed);
         }
     }
 
@@ -361,12 +382,17 @@ public:
                      std::unordered_map<uint32_t, int>& fd_by_client,
                      const void* data, size_t len) {
         if (state.out_len + len > sizeof(state.out_buf)) {
-            close_client(fd, states, fd_by_client);
-            return;
+            if (flush_out(fd, state, e_fd) < 0) {
+                close_client(fd, states, fd_by_client);
+                return;
+            }
+            if (state.out_len + len > sizeof(state.out_buf)) {
+                close_client(fd, states, fd_by_client);
+                return;
+            }
         }
         std::memcpy(state.out_buf + state.out_len, data, len);
         state.out_len += len;
-        if (flush_out(fd, state, e_fd) < 0) close_client(fd, states, fd_by_client);
     }
 
     // Drain this worker's ack queue across every shard (a worker's clients trade on
@@ -384,6 +410,17 @@ public:
                 send_report(fd, states[fd], e_fd, states, fd_by_client,
                             &ack.report, sizeof(ack.report));
             }
+        }
+        for (auto it = states.begin(); it != states.end(); ) {
+            if (it->second.out_len > 0) {
+                if (flush_out(it->first, it->second, e_fd) < 0) {
+                    int fd = it->first;
+                    ++it;
+                    close_client(fd, states, fd_by_client);
+                    continue;
+                }
+            }
+            ++it;
         }
     }
 
@@ -490,7 +527,8 @@ public:
                         }
 
                         uint16_t shard = inst % NUM_SHARDS;
-                        Order* o = pools[shard]->allocate(0, order_token, client_id, req.price, req.shares, inst, side, static_cast<uint16_t>(worker_id));
+                        Order* o = pools[shard]->allocate(worker_id, 0, order_token, client_id, req.price, req.shares, inst, side, static_cast<uint16_t>(worker_id));
+                        uint64_t a1 = __rdtscp(&aux);
                         if (!o) [[unlikely]] {
                             // Pool exhausted: too many live orders in this shard. The
                             // order never enters the book; reject it like a risk reject
@@ -504,6 +542,7 @@ public:
                         uint32_t internal_id = pools[shard]->index_of(o); // pool slot IS the handle
                         o->internal_id = internal_id;
                         session_manager.record_order(order_token, internal_id, inst, client_id);
+                        uint64_t r1 = __rdtscp(&aux);
                         EngineTask task;
                         task.type = MsgType::NEW;
                         task.order = o;
@@ -515,6 +554,9 @@ public:
                         total_decode_cycles.fetch_add(d2 - d1, std::memory_order_relaxed);
                         total_validation_cycles.fetch_add(v1 - d2, std::memory_order_relaxed);
                         total_enqueue_cycles.fetch_add(e1 - v1, std::memory_order_relaxed);
+                        total_allocate_cycles.fetch_add(a1 - v1, std::memory_order_relaxed);
+                        total_record_cycles.fetch_add(r1 - a1, std::memory_order_relaxed);
+                        total_push_cycles.fetch_add(e1 - r1, std::memory_order_relaxed);
                         total_orders_processed.fetch_add(1, std::memory_order_relaxed);
                     } else if (msg_type == 'X') {
                         uint64_t d1 = __rdtscp(&aux);

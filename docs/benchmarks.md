@@ -56,15 +56,26 @@ Measured on the development box after the Phase-0/1/3 work, from the counters ab
 
 | Stage | Cycles/order |
 | :--- | ---: |
-| Decode | ~82 |
-| Validate | ~24 |
-| Enqueue | ~340 |
+| Decode | ~162 |
+| Validate | ~53 |
+| Enqueue | ~536 |
+| ↳ Allocate | ~166 |
+| ↳ Record | ~47 |
+| ↳ Push | ~229 |
 
-These three are the most trustworthy figures here: they count instruction work per
-order rather than wall-clock contention, and they held within ~4% across runs on a
-loaded machine. `epoll_wait` and `read` dominate the total (tens of thousands of
-cycles/order) and are *not* quoted, because those are exactly the kernel-path costs
-that a loaded, non-isolated box distorts.
+These count instruction work per order rather than wall-clock contention, which is why
+they are the figures quoted. The full path also carries `epoll_wait` ~54, `read` ~117 and
+egress drain ~18, for **~946 cycles/order** total.
+
+Two claims that used to sit here have been withdrawn by measurement. The first was that
+`epoll_wait` and `read` *dominate* the total at "tens of thousands of cycles/order" — they
+are 171 cycles combined, 18% of the path, and the application side (Enqueue alone, 57%)
+dominates instead. That figure predates the egress-coalescing fix, when one `send()`
+syscall per 32-byte ack was charged to the read loop. The second was that these held
+"within ~4% across runs": across nine runs at 4×4 the same counters ranged Decode 126–273
+and Enqueue 416–1149, roughly ±2×, because per-order cost on this box depends on SMT
+placement (see [`bottlenecks.md`](./bottlenecks.md) §10). The medians are stable; the
+individual runs are not.
 
 ---
 
@@ -83,23 +94,15 @@ happily reports ~2.6M orders/s while the engine consumes ~0.2M.)
 
 | Gateway workers | Concurrent clients | Ingest (orders/sec) |
 | ---: | ---: | ---: |
-| 1 | 1 | ~207,000 |
-| 4 | 1 | ~215,000 |
-| 4 | 2 | ~587,000 |
-| 4 | 4 | **~1,081,000** |
-| 4 | 8 | ~1,068,000 |
+| 4 | 1 | ~533,000 |
+| 4 | 2 | ~1,186,000 |
+| 4 | 4 | **~1,676,000** |
 
 Two things fall out of this:
 
-**`SO_REUSEPORT` shards by connection, not by packet.** 4 workers with a single
-client performs the same as 1 worker (215k vs 207k) because the accepted connection
-is pinned to one worker and the other three idle. Multi-connection load is a
-prerequisite for gateway scaling, and any load generator that opens one socket will
-silently measure a single worker.
+**`SO_REUSEPORT` shards by connection, not by packet.** A single client pins all load to one worker regardless of `GATEWAY_THREADS`. Multi-connection load is a prerequisite for gateway scaling, and any load generator that opens one socket will silently measure a single worker.
 
-**Ingest saturates around 4 concurrent clients** on this machine (1.08M → 1.07M from
-4 to 8), consistent with oversubscription once gateway workers, engine shards, and
-the load generators together exceed the available cores.
+**Ingest is load-generator-bound at 1.68M orders/sec.** The measurement at 4 concurrent clients is the point where the `tester` instances saturate this host's ability to *generate* load — the gateway is ~48% idle and the engine shards ~89% idle at that point — rather than the true ceiling of the engine.
 
 > **This is a lower bound, not a capacity figure.** The run had no `SCHED_FIFO`
 > privilege, a `powersave` governor, and other applications running; the environment
@@ -173,20 +176,30 @@ remain design predictions — this box cannot measure them, see the `SCHED_FIFO`
    queueing delay substantially. Its *throughput* effect is confirmed (5× from 1 to 4
    clients); its *latency* effect is `TODO(measure)`.
 4. **The 4-Thread Operating Point:** four gateway threads with four concurrent clients
-   is where ingest peaks on this machine (~1.08M orders/sec), and adding clients past
-   that does not help — so the Phase-3.3 default is the right operating point here.
-5. **Thread Oversubscription:** confirmed directionally — going from 4 to 8 concurrent
-   clients slightly *reduces* ingest (1.08M → 1.07M) as gateway workers, engine shards
-   and load generators contend for the same cores.
+   reaches **1.68M orders/sec** (median of 9 runs, 52.7% spread) on this machine.
+   Ingest is *still climbing* at four clients — this is not a saturation point, it is
+   as far as one laptop can drive it while also hosting the load generators.
+5. **The measured ceiling is the load generator.** At the 1.68M point the gateway is
+   ~48% idle and the engine shards are ~89% idle, both parked in their empty-poll
+   branches. The exchange is pinned to the P-cores, so the `tester` processes run
+   on E-cores and cannot generate TCP traffic fast enough to feed a gateway that costs
+   ~950 cycles/order. An earlier note here claimed ingest *fell* from 4 to 8 clients
+   (1.08M → 1.07M); that was measured through the `orders_in` counter, which sits
+   downstream of the engine and was throttled by the OrderManager. It is withdrawn.
 
 ## Conclusions
 The functional goal — a documented run that actually matches orders through the full
 pipeline — is met (`results.txt`: 4 threads, 10,000 orders, 20,000 fills, 0 rejects).
-Gateway ingest is measured at **~1.08M orders/sec** on a developer desktop
-(`benchmark_results.txt`), scaling 5× with concurrent connections and saturating at
-four. The latency campaign stays open: it needs a box that can grant `SCHED_FIFO`.
+Gateway ingest is measured at **1.68M orders/sec** on a developer desktop
+(`benchmark_results.txt`), scaling 533k → 1.19M → 1.68M with concurrent connections and
+still climbing at four. The latency campaign stays open: it needs a box that can grant
+`SCHED_FIFO`.
 
-The design thesis is supported so far and unchanged: application-side work per order is
-small and stable (~82/24/340 cycles for decode/validate/enqueue) while the kernel
-networking path dominates the per-order total, which is what motivates the future
-kernel-bypass work (DPDK / ef_vi).
+The design thesis is supported, but the numbers behind it have changed: application-side
+work per order is small and stable (~162/53/536 cycles for decode/validate/enqueue) and
+the exchange is no longer the limiting stage at all — it idles waiting for the load
+generator. The earlier figures on this page (~82/24/340 cycles, ~1.08M orders/sec) were
+taken before five bottlenecks were found and removed, and before the throughput counter
+was moved to the engine; see [`bottlenecks.md`](./bottlenecks.md). Kernel-bypass work
+(DPDK / ef_vi) remains motivated by the per-order syscall cost, but that case now has to
+be argued from a gateway that costs ~950 cycles/order, not from a saturated one.

@@ -6,6 +6,8 @@
 #include <atomic>
 #include <sys/mman.h>
 #include <iostream>
+#include <memory>
+#include <vector>
 #include "core/lock_free_queue.h"
 
 // Define MAP_HUGETLB if not present (older headers)
@@ -17,24 +19,27 @@ template<typename T>
 class MemoryPool {
 private:
     T* pool;
-    LockFreeQueue<uint32_t, 16777216> recycle_queue; // 16M power-of-two
+    std::vector<std::unique_ptr<LockFreeQueue<uint32_t, 524288>>> recycle_queues;
 
     uint32_t pool_capacity;
-    uint32_t high_water_mark;
+    uint32_t slice_capacity;
+    uint32_t num_workers;
 
-    // Serializes the allocation fast-path only. Multiple SO_REUSEPORT gateway
-    // workers can allocate from the same shard pool concurrently, so the
-    // high_water bump and the recycle_queue pop (an SPSC ring with a single
-    // producer = the engine's deallocate) must not race across consumers.
-    // The engine's deallocate() stays lock-free; only allocate() takes this.
-    std::atomic_flag alloc_lock = ATOMIC_FLAG_INIT;
+    struct alignas(64) WorkerState {
+        std::atomic<uint32_t> high_water_mark{0};
+    };
+    std::unique_ptr<WorkerState[]> states;
 
 public:
-    // NOTE: slot index 0 is reserved as the "null handle" sentinel so that an
-    // internal_id / order handle of 0 unambiguously means "no order". Valid slot
-    // indices therefore start at 1, hence high_water_mark starts at 1.
-    explicit MemoryPool(uint32_t capacity)
-        : pool_capacity(capacity), high_water_mark(1) {
+    explicit MemoryPool(uint32_t capacity, uint32_t workers = 1)
+        : pool_capacity(capacity), num_workers(workers) {
+        
+        slice_capacity = capacity / num_workers;
+        states = std::make_unique<WorkerState[]>(num_workers);
+        for (uint32_t i = 0; i < num_workers; ++i) {
+            states[i].high_water_mark.store((i * slice_capacity) + (i == 0 ? 1 : 0), std::memory_order_relaxed);
+            recycle_queues.push_back(std::make_unique<LockFreeQueue<uint32_t, 524288>>());
+        }
 
         size_t size = sizeof(T) * capacity;
         
@@ -71,45 +76,40 @@ public:
     }
 
     template<typename... Args>
-    T* allocate(Args&&... args) {
-        while (alloc_lock.test_and_set(std::memory_order_acquire)) {
-            __builtin_ia32_pause();
-        }
+    T* allocate(int worker_id, Args&&... args) {
         uint32_t index;
-        if (recycle_queue.pop(index)) {
+        if (recycle_queues[worker_id]->pop(index)) {
             // Reused!
         } else {
-            uint32_t next = high_water_mark;
-            if (next < pool_capacity) [[likely]] {
-                high_water_mark = next + 1;
+            uint32_t next = states[worker_id].high_water_mark.load(std::memory_order_relaxed);
+            if (next < (worker_id + 1) * slice_capacity) [[likely]] {
+                states[worker_id].high_water_mark.store(next + 1, std::memory_order_relaxed);
                 index = next;
             } else {
-                // Exhaustion is a client behaviour (too many live orders), not a
-                // process fault. Return null so the gateway can reject the order
-                // exactly like a risk reject instead of tearing the engine down.
-                alloc_lock.clear(std::memory_order_release);
                 return nullptr;
             }
         }
-        alloc_lock.clear(std::memory_order_release);
-        // Construction is outside the lock: `index` is now uniquely owned by
-        // this caller, so no other thread can touch pool[index].
         return new (&pool[index]) T(std::forward<Args>(args)...);
     }
 
     void deallocate(T* ptr) {
         uint32_t index = static_cast<uint32_t>(ptr - pool);
-        while (!recycle_queue.push(index)) [[unlikely]] {
+        int worker_id = index / slice_capacity;
+        while (!recycle_queues[worker_id]->push(index)) [[unlikely]] {
             __builtin_ia32_pause();
         }
     }
 
-    // Slot index of a live pointer; used as the order's internal_id handle.
     inline uint32_t index_of(const T* ptr) const {
         return static_cast<uint32_t>(ptr - pool);
     }
 
-    // Approximate number of slots ever handed out (for monitoring / headroom).
-    inline uint32_t slots_used() const { return high_water_mark; }
+    inline uint32_t slots_used() const { 
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < num_workers; ++i) {
+            total += (states[i].high_water_mark.load(std::memory_order_relaxed) - (i * slice_capacity));
+        }
+        return total; 
+    }
     inline uint32_t capacity() const { return pool_capacity; }
 };

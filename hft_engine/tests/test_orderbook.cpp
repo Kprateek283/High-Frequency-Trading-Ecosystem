@@ -44,7 +44,8 @@ struct BookFixture {
     uint32_t submit(Side side, uint32_t price, uint32_t qty, uint64_t token,
                     uint32_t owner = 0) {
         if (owner == 0) owner = static_cast<uint32_t>(token);
-        Order* o = pool->allocate(0, token, owner, price, qty, uint16_t{0}, side);
+        Order* o = pool->allocate(0, 0, token, owner, price, qty, uint16_t{0}, side);
+        if (!o) return 0;
         uint32_t id = pool->index_of(o);
         o->internal_id = id;
         book->match_order(o);

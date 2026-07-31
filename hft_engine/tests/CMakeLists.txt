@@ -19,3 +19,4 @@ target_compile_options(engine_tests PRIVATE -UNDEBUG)
 target_link_libraries(engine_tests PRIVATE Threads::Threads)
 
 add_test(NAME engine_tests COMMAND engine_tests)
+target_sources(engine_tests PRIVATE test_ack_coalescing.cpp)

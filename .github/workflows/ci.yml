@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  cpp:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Release builds both trees; the sanitizer configs only carry
+          # flags in hft_engine/CMakeLists.txt, so they build engine_tests only.
+          - { name: release, build_type: Release, target: all }
+          - { name: asan,    build_type: Debug,   target: engine_tests }
+          - { name: tsan,    build_type: TSAN,    target: engine_tests }
+    name: cpp (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v4
+
+      # hft-trading-firm's book_builder.h needs header-only Boost. Only the
+      # Release leg builds that tree, but installing unconditionally keeps the
+      # matrix uniform and costs a few seconds.
+      - name: Install Boost headers
+        run: sudo apt-get update && sudo apt-get install -y libboost-dev
+
+      - name: Configure
+        # -march=native is in CMAKE_CXX_FLAGS_RELEASE; build and test run on the
+        # same runner, so it is safe here.
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Build
+        run: cmake --build build --target ${{ matrix.target }} -j"$(nproc)"
+
+      - name: Test
+        # TSan exits 0 on a reported race unless told otherwise -- without this
+        # the job would go green while printing warnings.
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: halt_on_error=1:detect_leaks=1
+        run: ctest --test-dir build --output-on-failure
+
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      # Self-skips the orchestrator suite when build/bin/exchange is absent.
+      - run: python3 -m monitoring.run_tests

@@ -14,7 +14,10 @@ int main() {
     RUN(test_orderbook);
     RUN(test_framing);
     RUN(test_identity);
+    RUN(test_ack_coalescing);
     RUN(test_pool);
+    RUN(test_pool_concurrency);
+    RUN(test_pool_recycle_concurrency);
     std::printf("all passed\n");
     return 0;
 }
