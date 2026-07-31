@@ -35,6 +35,7 @@ private:
     std::array<OrderBook, MAX_INSTRUMENTS> books;
     std::vector<LockFreeQueue<EngineTask, 524288>*> queues; // one per gateway worker
     std::vector<LockFreeQueue<OutboundAck, 524288>*> ack_queues; // egress, one per gateway worker (Step 2 plumbing; produced in Step 3)
+    uint16_t shard_id;
     LockFreeQueue<TscTuple, 1048576>& tsc_queue;
     std::atomic<bool>& running;
 };

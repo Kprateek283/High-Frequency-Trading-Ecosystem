@@ -78,6 +78,11 @@ struct HftStatsRegion {
     std::atomic<uint64_t> validation_cycles{0};
     std::atomic<uint64_t> enqueue_cycles{0};
     std::atomic<uint64_t> orders_processed{0};
+    // Number of drop-copy messages processed
+    alignas(64) std::atomic<uint64_t> drop_copies_processed{0};
+    
+    // Number of orders processed by the engine directly (one per shard)
+    alignas(64) std::atomic<uint64_t> engine_orders_in[STATS_MAX_SHARDS];
     ShardStats shards[STATS_MAX_SHARDS];
 };
 
