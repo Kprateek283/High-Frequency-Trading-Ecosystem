@@ -1,14 +1,27 @@
-# Gateway ingest sweep  2026-07-20T18:47:36Z
-# cores=16 load1=1.90 governor=powersave rtprio_limit=0 isolcpus=2,4,6,10,12,14
-# orders/s measured from stats-region orders_in over a 1.5s window, 3 runs per point (median reported)
+# Gateway ingest sweep  2026-07-31T20:23:16Z
+# cores=16 load1=0.58 governor=powersave rtprio_limit=0 isolcpus=none exchange_cpuset=0-7
+# orders/s measured from stats-region engine_orders_in (incremented by the matching engine itself, not the downstream OrderManager) over a 1.5s window, 9 runs per point (median reported)
 #
 # workers  clients  median_orders_per_s  spread_pct
-        1        1               207439       14.3
-        4        1               214805        1.1
-        4        2               586878        4.5
-        4        4              1081109        8.9
-        4        8              1068082        7.9
+        4        1               533282       12.9
+        4        2              1185907        7.2
+        4        4              1675517       52.7
 #
 # WARNING: this run had no SCHED_FIFO privilege and/or a scaling
 # governor. Treat the shape (does it scale?) as meaningful and the
 # absolute ceiling as a lower bound for this box only.
+#
+# Same sweep re-run at 2026-07-31T20:55:22Z with EXCHANGE_CPUSET=0,2,4,6 --
+# one thread per physical P-core instead of all eight SMT threads, 9 runs
+# per point:
+#
+#        4        1               251894       47.3
+#        4        2               939927       10.1
+#        4        4              1828434       64.5
+#
+# Restricting the exchange to physical cores lowers median cycles/order
+# (946 -> 697) but halves single-client throughput and costs 21% at two
+# clients; the 4-client points overlap well inside their spreads (52.7% and
+# 64.5%). Per-order efficiency and wall-clock throughput move in opposite
+# directions here, so 0-7 remains the published configuration.
+# See docs/bottlenecks.md "SMT siblings".
