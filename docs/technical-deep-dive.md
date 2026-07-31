@@ -1,6 +1,16 @@
 # Technical Deep Dive
 
-Achieving 10,000,000 messages per second requires abandoning standard application-level abstractions in favor of mechanical sympathy. This document details the specific C++ techniques used to optimize the hot path, ensuring deterministic sub-microsecond execution times.
+Driving millions of messages per second through a POSIX socket means abandoning standard
+application-level abstractions in favour of mechanical sympathy. This document details the
+specific C++ techniques used to optimise the hot path.
+
+Measured ingest on the development box is **1.68M orders/sec** at four gateway workers and
+four concurrent clients, costing ~946 cycles/order through the gateway
+([`benchmarks.md`](./benchmarks.md)). Execution-time *percentiles* are deliberately not
+claimed anywhere in this document: tail latency is exactly what arbitrary preemption
+destroys, and this box cannot grant `SCHED_FIFO`. Where an earlier draft asserted
+sub-microsecond or 10M msgs/sec figures, those came from an unoptimised reject-loop engine
+and have been withdrawn rather than carried forward.
 
 ---
 
@@ -110,7 +120,19 @@ while (true) {
 ## 6. `SO_REUSEPORT` Sharding
 
 ### The Problem
-On the benchmark hardware used for this project, a single `epoll`-based ingress thread saturated near 4M msgs/sec. Attempting to push 10M msgs/sec into a single thread overwhelms the ingress path and saturates the TCP receive buffers, resulting in massive queueing delay.
+A single `epoll`-based ingress thread is one core's worth of decode, validate and enqueue
+work, and every connection assigned to it queues behind that. Once offered load exceeds
+what the thread can drain, the backlog lands in the TCP receive buffer and shows up as
+queueing delay rather than as a refused connection — the failure mode is silent latency
+growth, not an error.
+
+> An earlier version of this section claimed a single thread "saturated near 4M msgs/sec"
+> and that 10M msgs/sec overwhelmed it. Both figures came from the unoptimised, 1-thread,
+> reject-loop engine whose numbers were withdrawn in the numeric-truth pass
+> (`docs/review-findings.md` A1/A2/B9); neither has been re-measured. The measured
+> single-connection ceiling on the current engine is **533k orders/sec**
+> ([`benchmarks.md`](./benchmarks.md)), and that is a connection-sharding limit, not an
+> `epoll` limit — see the Impact note below.
 
 ### The Implementation
 The system employs a Thread-per-Shard model utilizing the Linux `SO_REUSEPORT` socket option. 
@@ -120,7 +142,21 @@ setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 ```
 Multiple Gateway threads bind to the exact same IP and Port. The Linux kernel uses a native hash of the incoming connection's 4-tuple (Source IP, Source Port, Dest IP, Dest Port) to deterministically route each TCP stream to a specific Gateway thread.
 
-**Impact:** This design completely bypasses the need for a dedicated acceptor thread and avoids userspace connection handoffs. Scaling to 4 parallel Gateway threads eliminated the queueing delay and restored end-to-end latency to microsecond scales under 10M msgs/sec loads.
+**Impact:** This design bypasses the need for a dedicated acceptor thread and avoids
+userspace connection handoffs.
+
+The measured effect is on **throughput**, and it comes with a caveat that matters more than
+the speedup: the kernel hashes the 4-tuple, so `SO_REUSEPORT` shards *connections*, not
+*packets*. One client with one socket pins all its load to one worker no matter what
+`GATEWAY_THREADS` is set to — measured 533k orders/sec at 4 workers with a single client,
+rising to 1.19M at two and 1.68M at four (`benchmark_results.txt`). Concurrency has to come
+from connections; a load generator that opens one socket silently benchmarks one worker.
+
+Its effect on **latency** is unmeasured. The claim this paragraph used to make — that four
+threads "restored end-to-end latency to microsecond scales under 10M msgs/sec loads" — was
+never measured on the current engine and is withdrawn. Tail latency is what arbitrary
+preemption destroys, and this box cannot grant `SCHED_FIFO`, so the percentiles stay
+`TODO(measure)` pending isolated hardware ([`benchmark-setup.md`](./benchmark-setup.md)).
 
 ---
 
