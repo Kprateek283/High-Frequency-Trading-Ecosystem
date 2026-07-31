@@ -96,7 +96,7 @@ int main() {
     }
 
     for (int i = 0; i < NUM_SHARDS; ++i) {
-        pools[i] = std::make_unique<MemoryPool<Order>>(POOL_CAPACITY_PER_SHARD); // must match orders_by_id size
+        pools[i] = std::make_unique<MemoryPool<Order>>(POOL_CAPACITY_PER_SHARD, num_gw); // must match orders_by_id size
         mkt_data_queues[i] = std::make_unique<LockFreeQueue<ItchMessage, 1048576>>();
         drop_copy_queues[i] = std::make_unique<LockFreeQueue<DropCopyMessage, 1048576>>();
         tsc_queues[i] = std::make_unique<LockFreeQueue<TscTuple, 1048576>>();
@@ -207,6 +207,9 @@ int main() {
                 stats->orders_processed.store(server.total_orders_processed.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 stats->dropped_reports.store(g_stats.dropped_reports.load(std::memory_order_relaxed), std::memory_order_relaxed);
                 stats->dropped_drop_copies.store(g_stats.dropped_drop_copies.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                for (int i = 0; i < NUM_SHARDS; i++) {
+                    stats->engine_orders_in[i].store(g_stats.engine_orders_in[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+                }
             });
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -240,6 +243,17 @@ int main() {
               << g_stats.dropped_reports.load(std::memory_order_relaxed) << std::endl;
     std::cout << "Drop-copies dropped (drop-copy queue full): "
               << g_stats.dropped_drop_copies.load(std::memory_order_relaxed) << std::endl;
+    // Calculate and print Engine Idle Ratio
+    uint64_t total_idle_polls = 0;
+    uint64_t total_active_polls = 0;
+    for (int i = 0; i < NUM_SHARDS; i++) {
+        total_idle_polls += g_stats.engine_polls_idle[i].load(std::memory_order_relaxed);
+        total_active_polls += g_stats.engine_polls_active[i].load(std::memory_order_relaxed);
+    }
+    uint64_t total_polls = total_idle_polls + total_active_polls;
+    double engine_idle_ratio = (total_polls > 0) ? (static_cast<double>(total_idle_polls) / total_polls * 100.0) : 0.0;
+    std::cout << "Engine Idle Ratio : " << engine_idle_ratio << "%\n";
+
     std::cout << "Engine Halted." << std::endl;
 
     return 0;
