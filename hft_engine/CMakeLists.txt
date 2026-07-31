@@ -12,6 +12,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Aggressive compiler optimizations for the Hot Path (same as hft-trading-firm)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fsanitize=address")
+set(CMAKE_CXX_FLAGS_TSAN "-g -O2 -fsanitize=thread")
 
 # Threading library
 find_package(Threads REQUIRED)
@@ -25,8 +26,9 @@ add_executable(market_maker src/tools/market_maker.cpp)
 add_executable(generate_pcap src/tools/generate_pcap.cpp)
 add_executable(replay src/tools/replay.cpp)
 add_executable(liquidity src/tools/liquidity.cpp)
+add_executable(bench_orderbook src/tools/bench_orderbook.cpp)
 
-foreach(target exchange tester market_maker generate_pcap replay liquidity)
+foreach(target exchange tester market_maker generate_pcap replay liquidity bench_orderbook)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Werror -Wpedantic)
     target_link_libraries(${target} PRIVATE Threads::Threads)
 endforeach()
