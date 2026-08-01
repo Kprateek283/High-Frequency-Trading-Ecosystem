@@ -13,7 +13,7 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 | **Latency probes** | 5-point `__rdtscp` decomposition (4 on-wire + gateway ingress) |
 | **Gateway ingest** | **1.68M orders/sec** (median of 9 runs, spread 52.7%) at 4 workers × 4 concurrent clients; scales 533k → 1.19M → 1.68M as clients are added (`benchmark_results.txt`) |
 | **Gateway Ingest Path** | `epoll_wait` **~54**, `read` **~117**, Decode **~162**, Validate **~53**, Enqueue **~536** (Allocate **~166**, Record **~47**, Push **~229**), Egress drain **~18** — **~946 cycles/order** total (ingest path only, *not* the matching engine) |
-| **End-to-End Latency** | `TODO(measure)` — needs a box where `SCHED_FIFO` is grantable; see below |
+| **End-to-End Latency** | `TODO(measure)` — `SCHED_FIFO` is now granted here and made things *worse* ([`docs/scheduling.md`](./docs/scheduling.md)); the blocker is `isolcpus`, not privilege |
 
 > **Read the throughput number with its caveat.** It was measured by
 > [`scripts/measure_throughput.py`](./scripts/measure_throughput.py), which samples
@@ -48,11 +48,18 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 > efficiency and wall-clock throughput move in opposite directions, so `0-7` stays
 > the published configuration and the trade-off is recorded rather than resolved.
 >
-> **Latency percentiles are deliberately still unmeasured.** Tail latency is
-> precisely what arbitrary preemption destroys, and this box cannot grant
-> `SCHED_FIFO` (`ulimit -r` is 0), so p99/p99.9 figures from it would be
-> measuring the scheduler, not the engine. Publishing them would repeat the
-> mistake this project already corrected once.
+> **Latency percentiles are deliberately still unmeasured, and `SCHED_FIFO` did not
+> fix that.** The privilege is now granted (`ulimit -r` is 80, and the exchange
+> verifies per run that it got it: `RT_SCHED: granted=11/11 priority=80`). Realtime
+> scheduling turned out to be **59% slower** at one client, because `SCHED_FIFO` never
+> preempts a same-priority peer and the engine busy-spins — four shards hold four CPUs
+> permanently while eleven realtime threads contend for eight logical ones. RT
+> throttling then adds a ~50 ms deschedule every second, which alone would dominate any
+> p99.9. The full comparison and the three mechanisms behind it are in
+> [`docs/scheduling.md`](./docs/scheduling.md); the machine itself is described in
+> [`docs/machine-profile.md`](./docs/machine-profile.md). The real blocker is
+> `isolcpus`, not privilege. Publishing a tail from this box would repeat the mistake
+> this project already corrected once.
 >
 > Earlier headline numbers were measured on an unoptimised engine running a reject
 > loop (see [`docs/review-findings.md`](./docs/review-findings.md) A1/A2/B9) and were

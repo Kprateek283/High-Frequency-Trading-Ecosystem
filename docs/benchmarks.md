@@ -112,8 +112,10 @@ Two things fall out of this:
 > **End-to-end latency: the harness is complete; the *numbers* remain
 > `TODO(measure)`.** `run_sharding.sh` now runs with `LATENCY_PROFILE=1` and the
 > gateway emits e2e (`t1→t5`) and TCP-path (`t4→t5`) P50/P99/P99.9 alongside the
-> engine's matching-latency window, all in `results.txt`. But this box cannot grant
-> `SCHED_FIFO` (`ulimit -r` is 0) and runs a `powersave` governor, so the tail
+> engine's matching-latency window, all in `results.txt`. But `SCHED_FIFO`, though now granted, makes
+> throughput *worse* here and cannot fix the tail without `isolcpus`
+> (see [`scheduling.md`](./scheduling.md)), and the box runs a `powersave`
+> governor — so the tail
 > describes the Linux scheduler, not the engine — the same class of misleading figure
 > this project already removed once (review B9). The measured values here are a
 > *lower bound*; publishable figures need an isolated box. The 1M–10M msgs/sec ×

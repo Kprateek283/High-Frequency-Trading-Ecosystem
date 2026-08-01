@@ -8,7 +8,7 @@ Measured ingest on the development box is **1.68M orders/sec** at four gateway w
 four concurrent clients, costing ~946 cycles/order through the gateway
 ([`benchmarks.md`](./benchmarks.md)). Execution-time *percentiles* are deliberately not
 claimed anywhere in this document: tail latency is exactly what arbitrary preemption
-destroys, and this box cannot grant `SCHED_FIFO`. Where an earlier draft asserted
+destroys, and `SCHED_FIFO` is granted here but makes throughput worse and cannot fix the tail without `isolcpus` (see [`scheduling.md`](./scheduling.md)). Where an earlier draft asserted
 sub-microsecond or 10M msgs/sec figures, those came from an unoptimised reject-loop engine
 and have been withdrawn rather than carried forward.
 
@@ -26,7 +26,7 @@ When a new order arrives, the Gateway calls the pool's variadic `allocate()`, wh
 ```cpp
 Order* o = pool.allocate(internal_id, order_token, client_id, price, shares, inst, side);
 ```
-The allocate fast path is guarded by a spinlock (`alloc_lock`), not lock-free: multiple gateway workers can allocate from the same shard pool concurrently, so the high-water bump must be serialised. The engine's `deallocate()` stays lock-free.
+The allocate fast path takes **no lock and no shared atomic**. Each gateway worker owns a disjoint slice of the slot array plus its own SPSC recycle queue, so concurrent allocation from one shard pool needs no serialisation; `deallocate()` derives the owning worker from the slot index (`index / slice_capacity`) and routes the slot back to that worker's queue. An earlier design serialised the high-water bump behind a per-shard `atomic_flag` spinlock, which cost 535 cycles/order at four workers against 198 for the slices (see [`bottlenecks.md`](./bottlenecks.md) §9).
 
 **Impact:** Order creation avoids general-purpose heap allocation and reduces allocation overhead to a bounded constant-time operation.
 
@@ -155,7 +155,7 @@ from connections; a load generator that opens one socket silently benchmarks one
 Its effect on **latency** is unmeasured. The claim this paragraph used to make — that four
 threads "restored end-to-end latency to microsecond scales under 10M msgs/sec loads" — was
 never measured on the current engine and is withdrawn. Tail latency is what arbitrary
-preemption destroys, and this box cannot grant `SCHED_FIFO`, so the percentiles stay
+preemption destroys, and `SCHED_FIFO` is granted here but makes throughput worse and cannot fix the tail without `isolcpus` (see [`scheduling.md`](./scheduling.md)), so the percentiles stay
 `TODO(measure)` pending isolated hardware ([`benchmark-setup.md`](./benchmark-setup.md)).
 
 ---
