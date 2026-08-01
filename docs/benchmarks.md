@@ -54,30 +54,48 @@ decode path (`gateway/tcp_server.h`), exported in the shutdown stats and the `/d
 stats region. The micro-level split (`epoll_wait` / `read` / Decode / Validate / Enqueue)
 and the kernel-vs-application percentage come straight from these counters.
 
-Measured on the development box after the Phase-0/1/3 work, from the counters above:
+Measured over 9 runs at 4 workers × 4 clients, with the load generators pinned off the
+cores under measurement:
 
-| Stage | Cycles/order |
-| :--- | ---: |
-| Decode | ~162 |
-| Validate | ~53 |
-| Enqueue | ~536 |
-| ↳ Allocate | ~166 |
-| ↳ Record | ~47 |
-| ↳ Push | ~229 |
+| Stage | Cycles/order (median) | Range | Share |
+| :--- | ---: | ---: | ---: |
+| `epoll_wait` | 41 | 4–101 | 9% |
+| `read` | 41 | 39–48 | 9% |
+| Decode | 95 | 91–101 | 22% |
+| Validate | 17 | 16–22 | 4% |
+| Enqueue | 228 | 204–265 | 53% |
+| ↳ Allocate | 80 | 67–94 | |
+| ↳ Record | 19 | 17–23 | |
+| ↳ Push | 84 | 77–104 | |
+| Egress drain | 12 | 10–15 | 3% |
+| **Total** | **433** | **398–500** | |
 
-These count instruction work per order rather than wall-clock contention, which is why
-they are the figures quoted. The full path also carries `epoll_wait` ~54, `read` ~117 and
-egress drain ~18, for **~946 cycles/order** total.
+Three things about how to read this table.
 
-Two claims that used to sit here have been withdrawn by measurement. The first was that
-`epoll_wait` and `read` *dominate* the total at "tens of thousands of cycles/order" — they
-are 171 cycles combined, 18% of the path, and the application side (Enqueue alone, 57%)
-dominates instead. That figure predates the egress-coalescing fix, when one `send()`
-syscall per 32-byte ack was charged to the read loop. The second was that these held
-"within ~4% across runs": across nine runs at 4×4 the same counters ranged Decode 126–273
-and Enqueue 416–1149, roughly ±2×, because per-order cost on this box depends on SMT
-placement (see [`bottlenecks.md`](./bottlenecks.md) §10). The medians are stable; the
-individual runs are not.
+**These are elapsed cycles, not retired instructions.** `__rdtscp` reads a wall-clock
+counter, so a stall, a cache miss, or a preemption all land in the number. An earlier
+version of this section claimed the opposite — that the counters "count instruction work
+per order rather than wall-clock contention" — and used that to justify quoting them as a
+property of the code. It is wrong, and the correction is visible in the table: the same
+counters previously read ~946 cycles/order total, and roughly halved once the load
+generators stopped competing for the same cores. Nothing in the gateway changed. Contention
+was being reported as per-order cost.
+
+**The stage medians sum to 434 against a median total of 433.** That agreement is
+coincidence, not arithmetic: `Total/Order` is a true per-run sum in the code
+(`gateway/tcp_server.h`), but medians taken across runs need not add up. The previously
+published figures did not — stages summing to 940 were reported as a ~946 total.
+
+**Allocate + Record + Push (183) does not equal Enqueue (228), and cannot.** On the
+accepted path the three sub-spans tile the enqueue span exactly by construction. But the
+risk-reject path (`tcp_server.h:529`) increments `enqueue` without the three sub-counters,
+and this sweep's workload rejects 19–86% of orders (see below), so the shortfall is
+rejected orders. A related instrumentation gap: the pool-exhaustion path
+(`tcp_server.h:543`) increments the order count with *no* cycle counters at all, diluting
+every per-order average slightly downward.
+
+One claim previously withdrawn here still stands: `epoll_wait` and `read` do not dominate.
+They are 82 cycles combined, 19% of the path, while Enqueue alone is 53%.
 
 ---
 
@@ -104,7 +122,9 @@ Three things fall out of this:
 
 **`SO_REUSEPORT` shards by connection, not by packet.** A single client pins all load to one worker regardless of `GATEWAY_THREADS`. Multi-connection load is a prerequisite for gateway scaling, and any load generator that opens one socket will silently measure a single worker.
 
-**Ingest is load-generator-bound at 2.06M orders/sec.** The measurement at 4 concurrent clients is the point where the `tester` instances saturate this host's ability to *generate* load — the gateway is ~48% idle and the engine shards ~89% idle at that point — rather than the true ceiling of the engine.
+**Ingest is load-generator-bound at 2.06M orders/sec.** The measurement at 4 concurrent clients is the point where the `tester` instances saturate this host's ability to *generate* load — the gateway is **~87% idle** and the engine shards **~96% idle** at that point — rather than the true ceiling of the engine. (Those idle figures were previously given as ~48% and ~89%; both were measured while the generators were still competing with the exchange for cores.)
+
+**The figure counts *accepted* orders, not orders received.** `engine_orders_in` is incremented by the matching engine, and risk-rejected orders never reach it — they are answered by the gateway and dropped at `tcp_server.h:529`. Under this sweep's workload (`WORKLOAD_TYPE=2`, uniform-random symbols at unthrottled rate) the observed reject rate runs **19–86%**, climbing through a run as positions accumulate against the pre-trade risk limits. So the gateway is decoding materially more messages per second than 2.06M. Read the number as *engine intake*, which is what the counter measures, and note it is not comparable to the 0%-reject functional run in `results.txt`, which uses a different workload.
 
 **The benchmark used to measure itself.** These figures replace an earlier
 533k/1.19M/1.68M sweep, and the difference is a harness fix rather than an engine
@@ -201,10 +221,10 @@ remain design predictions — this box cannot measure them, see the `SCHED_FIFO`
    Ingest is *still climbing* at four clients — this is not a saturation point, it is
    as far as one laptop can drive it while also hosting the load generators.
 5. **The measured ceiling is the load generator.** At the 2.06M point the gateway is
-   ~48% idle and the engine shards are ~89% idle, both parked in their empty-poll
+   ~87% idle and the engine shards are ~96% idle, both parked in their empty-poll
    branches. The exchange is pinned to the P-cores and the `tester` processes to the
    E-cores, which cannot generate TCP traffic fast enough to feed a gateway that costs
-   ~950 cycles/order. An earlier note here claimed ingest *fell* from 4 to 8 clients
+   ~433 cycles/order. An earlier note here claimed ingest *fell* from 4 to 8 clients
    (1.08M → 1.07M); that was measured through the `orders_in` counter, which sits
    downstream of the engine and was throttled by the OrderManager. It is withdrawn.
 6. **Where the load generators run is part of the measurement.** Leaving them unpinned
@@ -222,10 +242,10 @@ cores rather than merely `SCHED_FIFO` privilege, which is granted here and makes
 throughput worse ([`scheduling.md`](./scheduling.md)).
 
 The design thesis is supported, but the numbers behind it have changed: application-side
-work per order is small and stable (~162/53/536 cycles for decode/validate/enqueue) and
+work per order is small (95/17/228 cycles for decode/validate/enqueue) and
 the exchange is no longer the limiting stage at all — it idles waiting for the load
 generator. The earlier figures on this page (~82/24/340 cycles, ~1.08M orders/sec) were
 taken before five bottlenecks were found and removed, and before the throughput counter
 was moved to the engine; see [`bottlenecks.md`](./bottlenecks.md). Kernel-bypass work
 (DPDK / ef_vi) remains motivated by the per-order syscall cost, but that case now has to
-be argued from a gateway that costs ~950 cycles/order, not from a saturated one.
+be argued from a gateway that costs ~433 cycles/order, not from a saturated one.

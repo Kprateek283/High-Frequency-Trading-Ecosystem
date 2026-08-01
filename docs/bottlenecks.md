@@ -386,6 +386,26 @@ full client sweep withdrew it. The failure mode is the one this document already
 twice: a real effect, measured at one operating point, generalised to a claim the data did
 not cover.
 
+### Postscript — the bimodality does not reproduce
+
+Nine fresh runs after the harness fix (`config.env` actually applied, load generators
+pinned off the measured cores, corrected core map) measure `Total/Order` at **398–500,
+unimodal, median 433** — against 742–1861 bimodal before. The two clusters are gone, and
+so is roughly half the absolute cost.
+
+The SMT reasoning above is not withdrawn: two workers sharing one core's execution ports
+*would* produce exactly that signature, and the `0,2,4,6` arm did remove the high cluster.
+But the fresh data admits a second explanation that was not controlled for. `__rdtscp`
+counts **elapsed** cycles, not retired instructions, so an unpinned load generator
+competing for the same physical core inflates "cycles/order" without the gateway executing
+anything extra — and until the harness fix, the generators were doing exactly that on
+every run.
+
+Two variables moved together here (generator placement and the core map), so this is
+recorded as **not attributed**. What can be said: the bimodality was at least partly a
+measurement artifact rather than purely a property of the code, and any future use of
+these counters has to control generator placement first.
+
 ---
 
 ## What Was *Not* the Bottleneck

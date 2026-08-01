@@ -151,18 +151,30 @@ there and the load generator runs elsewhere. The core map lives in `config.env`:
 
 ```
 GATEWAY_CORES=1,3,5,7     # gateway workers
-ENGINE_CORES=2,4,6,8      # engine shards
-AUX_CORES=0,9             # publisher, order_manager
+ENGINE_CORES=0,2,4,6      # engine shards
+AUX_CORES=8,9,10          # publisher, order_manager, dispatcher
 ```
 
-So isolate **cores 1–8** — the gateway + engine hot path. Cores **0 and 9** host the
-aux threads (publisher, order_manager); they stay non-isolated alongside the OS and
-the load generator. (`scripts/setup_isolcpus.sh` writes exactly this GRUB line.) Edit the
-kernel command line in `/etc/default/grub`:
+So isolate **CPUs 0–7** — the gateway + engine hot path, which on this box is four
+physical P-cores and their SMT siblings. CPUs **8–10** host the cold aux threads and stay
+non-isolated alongside the OS; **11–15** are where the load generators run
+(`TESTER_CPUSET`). Edit the kernel command line in `/etc/default/grub`:
 
 ```
-GRUB_CMDLINE_LINUX_DEFAULT="quiet splash isolcpus=1-8 nohz_full=1-8 rcu_nocbs=1-8"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet splash isolcpus=0-7 nohz_full=0-7 rcu_nocbs=0-7"
 ```
+
+> **`scripts/setup_isolcpus.sh` is stale** — it still writes `isolcpus=1-8`, which
+> matches neither this map nor the P/E boundary at CPU 7 (CPU 8 is an efficiency core).
+> Do not run it without editing it first.
+>
+> **Isolating alone will not give you the hot path.** `iwlwifi` IRQs are currently
+> serviced on CPUs 3, 5, 6 and 7 — inside the set above — so IRQ affinity has to move
+> first. See [`machine-profile.md`](./machine-profile.md).
+>
+> And note what isolation cannot fix here: 11 threads request realtime and there are only
+> 4 physical P-cores, which is why `SCHED_FIFO` currently measures *slower*
+> ([`scheduling.md`](./scheduling.md)).
 
 Then:
 ```bash

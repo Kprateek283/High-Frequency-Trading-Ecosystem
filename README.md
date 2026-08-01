@@ -12,7 +12,7 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 | **Gateway Architecture** | 4-thread `SO_REUSEPORT` sharding |
 | **Latency probes** | 5-point `__rdtscp` decomposition (4 on-wire + gateway ingress) |
 | **Gateway ingest** | **2.06M orders/sec** (median of 9 runs, spread 19.4%) at 4 workers × 4 concurrent clients; scales 481k → 1.09M → 2.06M as clients are added (`benchmark_results.txt`) |
-| **Gateway Ingest Path** | `epoll_wait` **~54**, `read` **~117**, Decode **~162**, Validate **~53**, Enqueue **~536** (Allocate **~166**, Record **~47**, Push **~229**), Egress drain **~18** — **~946 cycles/order** total (ingest path only, *not* the matching engine) |
+| **Gateway Ingest Path** | `epoll_wait` **41**, `read` **41**, Decode **95**, Validate **17**, Enqueue **228** (Allocate **80**, Record **19**, Push **84**), Egress drain **12** — **433 cycles/order** total, median of 9 runs (ingest path only, *not* the matching engine). These are *elapsed* cycles from `__rdtscp`, so they include stalls and contention — see [`benchmarks.md`](./docs/benchmarks.md) |
 | **End-to-End Latency** | `TODO(measure)` — `SCHED_FIFO` is now granted here and made things *worse* ([`docs/scheduling.md`](./docs/scheduling.md)); the blocker is `isolcpus`, not privilege |
 
 > **Read the throughput number with its caveat.** It was measured by
@@ -26,12 +26,12 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 > the matching engine itself, on its own cache line, per shard.
 >
 > **This ceiling is the load generator, not the exchange.** At the 2.06M operating
-> point the gateway is **~48% idle** and the engine shards are **~89% idle** — both
+> point the gateway is **~87% idle** and the engine shards are **~96% idle** — both
 > sit in their empty-poll branches waiting for work. Firm and exchange share one
 > laptop; the exchange is pinned to the P-cores (`EXCHANGE_CPUSET`, default `0-10`)
 > and the `tester` processes to the E-cores (`TESTER_CPUSET`, default `11-15`), so
 > the generators cannot produce TCP traffic fast enough to saturate a gateway that
-> costs ~950 cycles/order. Ingest was still climbing at four clients — it has not
+> costs ~433 cycles/order. Ingest was still climbing at four clients — it has not
 > saturated, and the number is a floor for this box, not a ceiling for the design.
 >
 > **The jump from the previously published 1.68M is a harness fix, not an engine
@@ -43,20 +43,18 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 > parallelism to offset running the generators on 3300 MHz E-cores. Full attribution,
 > including the arm that isolates the core map, is in `benchmark_results.txt`.
 >
-> **Per-order cycle counts are bimodal on this box, and it is SMT.** Across the nine
-> runs at 4×4, `Total/Order` splits into two clusters — five runs at 742–1056 and
-> three at 1601–1861 — while the calibrated TSC stays at 2.11 cycles/ns throughout.
-> A constant TSC means those are real extra cycles, not the governor. Re-pinning to
-> one thread per physical P-core (`EXCHANGE_CPUSET=0,2,4,6`) removes the high cluster
-> (median 946 → 697 cycles/order, max 1097), which points at gateway workers landing
-> on SMT siblings of the same physical core. It is **not** a free win: the same
-> change halves single-client throughput (533k → 252k) and costs 21% at two clients,
-> because four logical CPUs cannot host the exchange's ~10 threads. Per-order
-> efficiency and wall-clock throughput move in opposite directions, so the
-> SMT-inclusive layout stays the published configuration — now `0-10`, which adds
-> E-cores 8–10 for the three cold aux threads — and the trade-off is recorded rather
-> than resolved. (Those cycle figures predate the harness fix described above; the
-> trade-off they record is unaffected, since both arms were measured the same way.)
+> **Per-order cycle counts used to be bimodal, and no longer are.** Under the old
+> harness, `Total/Order` across nine runs split into two clusters — five at 742–1056
+> and three at 1601–1861 — and that was attributed to gateway workers landing on SMT
+> siblings ([`docs/bottlenecks.md`](./docs/bottlenecks.md) §10). Nine fresh runs
+> measure 398–500, unimodal, median 433. The split is gone, and so is roughly half
+> the absolute cost. Two things changed at once — the load generators moved off the
+> measured cores, and the core map was corrected — so **which one dissolved the
+> bimodality is not attributed**, though generator contention is the likelier
+> candidate given `__rdtscp` counts elapsed cycles rather than retired instructions.
+> The recorded trade-off from that analysis (per-order efficiency and wall-clock
+> throughput move in opposite directions, so the SMT-inclusive layout — now `0-10` —
+> stays published) is unaffected: both of its arms were measured the same way.
 >
 > **Latency percentiles are deliberately still unmeasured, and `SCHED_FIFO` did not
 > fix that.** The privilege is now granted (`ulimit -r` is 80, and the exchange

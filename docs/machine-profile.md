@@ -148,33 +148,41 @@ before `isolcpus` will actually isolate anything.
 
 ---
 
-## Repository core map (`config.env`) — currently misaligned
+## Repository core map (`config.env`)
 
 ```
 GATEWAY_THREADS=4
 GATEWAY_CORES=1,3,5,7
-ENGINE_CORES=2,4,6,8
-AUX_CORES=0,9
+ENGINE_CORES=0,2,4,6
+AUX_CORES=8,9,10
 ```
 
-Resolved against the topology above:
+Resolved against the topology above — verify with `./scripts/verify_core_map.sh`:
 
 | Physical core | Type | Occupants |
 |---|---|---|
-| 0 | P | aux0 (publisher) @cpu0 + gateway worker @cpu1 — **collision** |
-| 1 | P | engine shard 0 @cpu2 + gateway worker @cpu3 — **collision** |
-| 2 | P | engine shard 1 @cpu4 + gateway worker @cpu5 — **collision** |
-| 3 | P | engine shard 2 @cpu6 + gateway worker @cpu7 — **collision** |
-| 4 | **E** | engine shard 3 @cpu8 — **on an efficiency core** |
-| 5 | **E** | aux1 (order_manager) @cpu9 |
+| 0 | P | engine shard 0 @cpu0 + gateway worker 0 @cpu1 |
+| 1 | P | engine shard 1 @cpu2 + gateway worker 1 @cpu3 |
+| 2 | P | engine shard 2 @cpu4 + gateway worker 2 @cpu5 |
+| 3 | P | engine shard 3 @cpu6 + gateway worker 3 @cpu7 |
+| 4, 5, 6 | E | publisher @cpu8, order_manager @cpu9, dispatcher @cpu10 |
 
-Every engine shard shares a physical core with a gateway worker, and the fourth shard
-runs on a 3300 MHz E-core while its peers run at 4400 MHz. The map reads as "even CPUs
-for engines, odd for gateway", which would be correct on a non-SMT, non-hybrid machine.
-It is wrong on this one, and it is a direct cause of the per-order cost variance recorded
-in [`bottlenecks.md`](./bottlenecks.md) §10.
+There are 8 hot threads and 4 physical P-cores, so SMT sharing is forced. The pairing is
+therefore chosen rather than inherited: `engine_i` sits on the sibling of `gateway_i`, so
+the SPSC handoff between a worker and the shard it feeds stays in a shared L1/L2. The
+three cold aux threads are off the P-cores entirely.
 
-Fixing this is a prerequisite for the `isolcpus` work, not a separate cleanup.
+**The previous map was `ENGINE_CORES=2,4,6,8` / `AUX_CORES=0,9`**, which ran off the end
+of the P-cores — shard 3 alone sat on a 3300 MHz E-core while its peers ran at 4400 — and
+paired each shard with a *stranger* worker rather than its own producer. Measured on its
+own the correction was within noise (−6% against a 35–101% spread), so it is kept for
+correctness and as an `isolcpus` prerequisite, not as a speedup.
+
+> Note for anyone reading the older analysis: until the harness was fixed to apply
+> `config.env` at all, `scripts/measure_throughput.py` never exported these variables, so
+> the sweeps ran on the fallbacks in `exchange.cpp` **with the gateway workers unpinned**.
+> The collision table this section used to present as the map under test was not, in fact,
+> the map under test.
 
 ---
 
@@ -198,7 +206,7 @@ Fixing this is a prerequisite for the `isolcpus` work, not a separate cleanup.
 - **Latency percentiles.** No `isolcpus`, a scaling governor that reverts itself, and RT
   throttling against a busy-poll engine. p99/p99.9 here describe the Linux scheduler.
 - **True ingest ceiling.** The load generators share the box with the exchange; at the
-  published operating point the gateway is ~48% idle and the engine shards ~89% idle.
+  published operating point the gateway is ~87% idle and the engine shards ~96% idle.
 - **Anything about real NICs.** Loopback only, 65536 MTU, no driver and no interrupts —
   so the `t4→t5` "TCP path" is a memcpy through the kernel, and the kernel-bypass case
   (DPDK / `ef_vi`) is not merely unmeasured here but unevaluable.

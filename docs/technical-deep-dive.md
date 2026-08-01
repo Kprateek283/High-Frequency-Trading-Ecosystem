@@ -5,7 +5,7 @@ application-level abstractions in favour of mechanical sympathy. This document d
 specific C++ techniques used to optimise the hot path.
 
 Measured ingest on the development box is **2.06M orders/sec** at four gateway workers and
-four concurrent clients, costing ~946 cycles/order through the gateway
+four concurrent clients, costing ~433 cycles/order through the gateway
 ([`benchmarks.md`](./benchmarks.md)). Execution-time *percentiles* are deliberately not
 claimed anywhere in this document: tail latency is exactly what arbitrary preemption
 destroys, and `SCHED_FIFO` is granted here but makes throughput worse and cannot fix the tail without `isolcpus` (see [`scheduling.md`](./scheduling.md)). Where an earlier draft asserted
