@@ -1,4 +1,4 @@
-# HFT ecosystem run  2026-07-25T18:24:03Z
+# HFT ecosystem run  2026-08-01T16:04:58Z
 Gateway Threads : 4
 entries       : 30000
 NEW           : 10000
@@ -16,12 +16,12 @@ REJECTED      : 0
 
 --- Latency (Last Window) ---
 Orders in Window: 20000
-Avg Latency:      312.921 ns (660.665 cycles)
-P50 (Median):     228.77 ns (483 cycles)
-P99:              2818.19 ns (5950 cycles)
-P99.9:            6814.8 ns (14388 cycles)
-P99.99:           14887.1 ns (31431 cycles)
-Max:              18345.2 ns (38732 cycles)
+Avg Latency:      1256.7 ns (2653.99 cycles)
+P50 (Median):     1220.24 ns (2577 cycles)
+P99:              2838.71 ns (5995 cycles)
+P99.9:            9466.48 ns (19992 cycles)
+P99.99:           27133.7 ns (57303 cycles)
+Max:              52421.2 ns (110707 cycles)
 
 Shutdown signal received. Joining threads...
 
@@ -32,45 +32,78 @@ Samples       : 20000
 UDP Path      : 0 cycles
 Trading Engine: 0 cycles
 SPSC Queue    : 0 cycles
-TCP Path      : 20383 cycles
+TCP Path      : 59648 cycles
 ----------------------------------------
-End-to-End    : 20383 cycles
+End-to-End    : 59648 cycles
 ========================================
 
 ========================================
  Exchange Gateway Attribution (Average) 
 ========================================
-epoll_wait() : 39963 cycles/order
-read()       : 4182 cycles/order
-Decode       : 181 cycles/order
-Validation   : 24 cycles/order
-Enqueue      : 174 cycles/order
-Total/Order  : 44527 cycles/order
-Calibrated TSC: 2.11132 cycles/ns
+epoll_wait() : 31081 cycles/order
+read()       : 19483 cycles/order
+Decode       : 637 cycles/order
+Validation   : 76 cycles/order
+Enqueue (Sum): 765 cycles/order
+  - Allocate : 332 cycles/order
+  - Record   : 81 cycles/order
+  - Push     : 352 cycles/order
+Egress Drain : 6613 cycles/order
+Total/Order  : 58659 cycles/order
+Gateway Idle Ratio: 93.2762%
+Calibrated TSC: 2.11177 cycles/ns
 ========================================
 
 --- Gateway End-to-End Latency (t1->t5) ---
 Orders in Window: 20000
-Avg Latency:      9654.17 ns (20383.1 cycles)
-P50 (Median):     8565.72 ns (18085 cycles)
-P99:              31645.6 ns (66814 cycles)
-P99.9:            66461.7 ns (140322 cycles)
-P99.99:           101016 ns (213277 cycles)
-Max:              122417 ns (258461 cycles)
+Avg Latency:      28245.6 ns (59648.1 cycles)
+P50 (Median):     28611.6 ns (60421 cycles)
+P99:              50055.7 ns (105706 cycles)
+P99.9:            84176 ns (177760 cycles)
+P99.99:           278426 ns (587970 cycles)
+Max:              342360 ns (722984 cycles)
 
 --- Gateway TCP Path Latency (t4->t5) ---
 Orders in Window: 20000
-Avg Latency:      9654.01 ns (20383.1 cycles)
-P50 (Median):     8565.58 ns (18085 cycles)
-P99:              31645.1 ns (66814 cycles)
-P99.9:            66460.6 ns (140322 cycles)
-P99.99:           101014 ns (213277 cycles)
-Max:              122415 ns (258461 cycles)
+Avg Latency:      28244.2 ns (59648.1 cycles)
+P50 (Median):     28610.1 ns (60421 cycles)
+P99:              50053.2 ns (105706 cycles)
+P99.9:            84171.7 ns (177760 cycles)
+P99.99:           278412 ns (587970 cycles)
+Max:              342342 ns (722984 cycles)
 
 Market-data reports dropped (ITCH queue full): 0
 Drop-copies dropped (drop-copy queue full): 0
+Engine Idle Ratio : 99.8547%
+RT_SCHED: granted=0/0 priority=0 threads=11
 Engine Halted.
 
+# ---- How to read the numbers above ----
+#
+# This is a FUNCTIONAL run: a deterministic crossing driver (tools/liquidity)
+# proving the pipeline matches orders end to end. The counts (NEW, matches,
+# FILLED, REJECTED) are the point. The timings are not a latency benchmark,
+# for three specific reasons:
+#
+# 1. UDP Path / Trading Engine / SPSC Queue read 0 BY CONSTRUCTION.
+#    liquidity.cpp stamps t1=t2=t3=t4 with a single send-time TSC because it
+#    has no firm-side pipeline to measure. Only t5-t4 (TCP path) is real here.
+#    For a populated five-point decomposition, drive the exchange with the
+#    trading firm (LocalExchangeConnector), which stamps each stage separately.
+#
+# 2. TCP path and end-to-end are BURST QUEUEING DELAY, not per-order latency.
+#    liquidity stamps every order at send time and blasts 20k of them
+#    unthrottled, so the gateway drains a backlog it never had a chance to
+#    keep up with. t5-t4 therefore grows through the burst and its average is
+#    roughly half the total drain. It measures the queue, which is real, but
+#    it is not the number to quote for network latency.
+#
+# 3. The gateway cycle attribution here is NOT comparable to
+#    cycle_attribution.txt. epoll_wait in particular is inflated: this run is
+#    ~95% idle and amortises blocking time over only 20k orders, where the
+#    sustained sweep amortises it over millions. Use cycle_attribution.txt
+#    for per-stage cost; use this file for correctness.
+#
 # Gateway ingest throughput sweep (workers x clients): see
 #   benchmark_results.txt (regenerate with scripts/measure_throughput.py).
 # For the latency matrix across shard counts, re-run this script with
@@ -80,3 +113,7 @@ Engine Halted.
 #   grants SCHED_FIFO (ulimit -r) and uses the 'performance' governor with
 #   isolated cores. The measurement code is complete; the numbers become
 #   publishable only on such hardware (docs/benchmarks.md, Phase 3.5).
+#
+# RT_SCHED threads=N above is the readiness barrier's own denominator. If it
+#   is short of 11 for this run, READY fired early and the numbers
+#   below it describe a partially-started engine.

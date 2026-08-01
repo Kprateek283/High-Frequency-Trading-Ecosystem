@@ -11,6 +11,16 @@ cd "$REPO_ROOT"
 [ -f config.env ] && set -a && . ./config.env && set +a
 : "${GATEWAY_THREADS:=4}"
 
+# Realtime is opt-in here. Left at its default (80), the engine's four matching
+# shards busy-spin at SCHED_FIFO and are never preempted by anything lower --
+# including this script's own `kill -INT`, and including the IRQ threads for the
+# machine's network card. On a box where `ulimit -r` is non-zero that wedges the
+# machine hard enough to need a power cycle. RT_PRIORITY=0 is also what the
+# published benchmarks use (docs/scheduling.md), so it is the honest default for
+# the documented entry point. Export RT_PRIORITY explicitly to override.
+: "${RT_PRIORITY:=0}"
+export RT_PRIORITY
+
 BIN="$REPO_ROOT/build/bin"
 RESULTS="$REPO_ROOT/results.txt"
 AUDIT="$REPO_ROOT/order_audit.log"
@@ -81,6 +91,32 @@ cat "$ENGINE_LOG"
     # liquidity run, so it's a window or two — not pages of metrics.)
     awk '/\[Metrics\]|Shutdown signal received/{f=1} f' "$ENGINE_LOG"
     echo ""
+    echo "# ---- How to read the numbers above ----"
+    echo "#"
+    echo "# This is a FUNCTIONAL run: a deterministic crossing driver (tools/liquidity)"
+    echo "# proving the pipeline matches orders end to end. The counts (NEW, matches,"
+    echo "# FILLED, REJECTED) are the point. The timings are not a latency benchmark,"
+    echo "# for three specific reasons:"
+    echo "#"
+    echo "# 1. UDP Path / Trading Engine / SPSC Queue read 0 BY CONSTRUCTION."
+    echo "#    liquidity.cpp stamps t1=t2=t3=t4 with a single send-time TSC because it"
+    echo "#    has no firm-side pipeline to measure. Only t5-t4 (TCP path) is real here."
+    echo "#    For a populated five-point decomposition, drive the exchange with the"
+    echo "#    trading firm (LocalExchangeConnector), which stamps each stage separately."
+    echo "#"
+    echo "# 2. TCP path and end-to-end are BURST QUEUEING DELAY, not per-order latency."
+    echo "#    liquidity stamps every order at send time and blasts 20k of them"
+    echo "#    unthrottled, so the gateway drains a backlog it never had a chance to"
+    echo "#    keep up with. t5-t4 therefore grows through the burst and its average is"
+    echo "#    roughly half the total drain. It measures the queue, which is real, but"
+    echo "#    it is not the number to quote for network latency."
+    echo "#"
+    echo "# 3. The gateway cycle attribution here is NOT comparable to"
+    echo "#    cycle_attribution.txt. epoll_wait in particular is inflated: this run is"
+    echo "#    ~95% idle and amortises blocking time over only 20k orders, where the"
+    echo "#    sustained sweep amortises it over millions. Use cycle_attribution.txt"
+    echo "#    for per-stage cost; use this file for correctness."
+    echo "#"
     echo "# Gateway ingest throughput sweep (workers x clients): see"
     echo "#   benchmark_results.txt (regenerate with scripts/measure_throughput.py)."
     echo "# For the latency matrix across shard counts, re-run this script with"
@@ -90,6 +126,10 @@ cat "$ENGINE_LOG"
     echo "#   grants SCHED_FIFO (ulimit -r) and uses the 'performance' governor with"
     echo "#   isolated cores. The measurement code is complete; the numbers become"
     echo "#   publishable only on such hardware (docs/benchmarks.md, Phase 3.5)."
+    echo "#"
+    echo "# RT_SCHED threads=N above is the readiness barrier's own denominator. If it"
+    echo "#   is short of $(( GATEWAY_THREADS + 4 + 3 )) for this run, READY fired early and the numbers"
+    echo "#   below it describe a partially-started engine."
 } > "$RESULTS"
 
 echo "Benchmark complete. Results written to results.txt:"

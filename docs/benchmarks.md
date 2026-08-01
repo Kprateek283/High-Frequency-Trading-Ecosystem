@@ -191,10 +191,19 @@ them — the accepted/rejected split A2 asked for:
 | PARTIAL_FILL / CANCELED | 0 / 0 |
 | **REJECTED** | **0** |
 
-Reject rate is now **0%** — a property of the workload fitting the 256-instrument cap with
-symbols that decode, not of a parsing failure (contrast the pre-fix 74.4% reject rate in
-review A2). Ingest throughput for the gateway is measured above; end-to-end latency for
-this run is `TODO(measure)`.
+Reject rate is now **0%** — a property of *this* workload fitting the 256-instrument cap
+with symbols that decode, not of a parsing failure (contrast the pre-fix 74.4% reject rate
+in review A2). Note it is specific to the deterministic crossing driver: the throughput
+sweep uses `WORKLOAD_TYPE=2` and rejects 19–86% on pre-trade risk, as described above.
+
+`results.txt` also carries latency figures, and they are **not** the missing end-to-end
+measurement — that stays `TODO(measure)`. Three reasons, all recorded in the file itself:
+`liquidity` stamps `t1=t2=t3=t4` with one send-time TSC, so three of the five stages read
+zero by construction; it blasts 20k orders unthrottled, so `t5−t4` is burst *queueing*
+delay rather than per-order network latency; and its gateway cycle attribution is not
+comparable to `cycle_attribution.txt`, since a ~95%-idle 20k-order run amortises
+`epoll_wait` blocking over a tiny denominator. A populated five-point decomposition needs
+the trading firm (`LocalExchangeConnector`), which stamps each stage separately.
 
 ---
 
