@@ -372,8 +372,13 @@ down with them.
 
 None — and that is the entry. **Cycles/order and orders/second are different quantities,
 and here they move in opposite directions.** Optimising the first would have made the
-system worse at the second. `0-7` remains the published configuration because throughput is
-what the benchmark claims to measure; the efficiency win is recorded and left on the table.
+system worse at the second. The SMT-inclusive layout remains the published configuration
+because throughput is what the benchmark claims to measure; the efficiency win is recorded
+and left on the table. (`EXCHANGE_CPUSET` has since defaulted to `0-10` rather than `0-7`,
+which adds E-cores 8–10 for the three cold aux threads and leaves the P-core layout under
+test here unchanged. Both arms above were measured on the pre-`config.env` harness — see
+`benchmark_results.txt` — so their absolute numbers predate the current sweep, but the
+comparison between them holds.)
 
 An earlier draft of this measurement ran six iterations at the 4×4 point only, saw
 1.95M vs 1.68M, and concluded physical-core pinning was a 16% win. Nine runs across the

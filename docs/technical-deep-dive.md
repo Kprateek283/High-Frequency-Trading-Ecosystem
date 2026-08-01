@@ -4,7 +4,7 @@ Driving millions of messages per second through a POSIX socket means abandoning 
 application-level abstractions in favour of mechanical sympathy. This document details the
 specific C++ techniques used to optimise the hot path.
 
-Measured ingest on the development box is **1.68M orders/sec** at four gateway workers and
+Measured ingest on the development box is **2.06M orders/sec** at four gateway workers and
 four concurrent clients, costing ~946 cycles/order through the gateway
 ([`benchmarks.md`](./benchmarks.md)). Execution-time *percentiles* are deliberately not
 claimed anywhere in this document: tail latency is exactly what arbitrary preemption
@@ -130,7 +130,7 @@ growth, not an error.
 > and that 10M msgs/sec overwhelmed it. Both figures came from the unoptimised, 1-thread,
 > reject-loop engine whose numbers were withdrawn in the numeric-truth pass
 > (`docs/review-findings.md` A1/A2/B9); neither has been re-measured. The measured
-> single-connection ceiling on the current engine is **533k orders/sec**
+> single-connection ceiling on the current engine is **481k orders/sec**
 > ([`benchmarks.md`](./benchmarks.md)), and that is a connection-sharding limit, not an
 > `epoll` limit — see the Impact note below.
 
@@ -148,8 +148,8 @@ userspace connection handoffs.
 The measured effect is on **throughput**, and it comes with a caveat that matters more than
 the speedup: the kernel hashes the 4-tuple, so `SO_REUSEPORT` shards *connections*, not
 *packets*. One client with one socket pins all its load to one worker no matter what
-`GATEWAY_THREADS` is set to — measured 533k orders/sec at 4 workers with a single client,
-rising to 1.19M at two and 1.68M at four (`benchmark_results.txt`). Concurrency has to come
+`GATEWAY_THREADS` is set to — measured 481k orders/sec at 4 workers with a single client,
+rising to 1.09M at two and 2.06M at four (`benchmark_results.txt`). Concurrency has to come
 from connections; a load generator that opens one socket silently benchmarks one worker.
 
 Its effect on **latency** is unmeasured. The claim this paragraph used to make — that four

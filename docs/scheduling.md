@@ -25,6 +25,11 @@ The spread matters as much as the median: at one and two clients, realtime sched
 took run-to-run variance from ~10% to ~90%. That is the signature of a scheduling
 pathology, not of a slower code path.
 
+> Both arms above were measured before the harness was fixed to apply `config.env` and
+> to pin the load generators off the cores under measurement, so these absolute numbers
+> differ from the current sweep in `benchmark_results.txt`. The comparison is unaffected —
+> both arms ran through the same harness, and the only variable was scheduling policy.
+
 Realtime was verified per run rather than assumed — the exchange printed
 `RT_SCHED: granted=11/11 priority=80` on every one.
 

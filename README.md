@@ -11,7 +11,7 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 | **Functional run** | 4-thread gateway matches orders end-to-end: 10,000 orders → 20,000 fills, **0 rejects** (`results.txt`) |
 | **Gateway Architecture** | 4-thread `SO_REUSEPORT` sharding |
 | **Latency probes** | 5-point `__rdtscp` decomposition (4 on-wire + gateway ingress) |
-| **Gateway ingest** | **1.68M orders/sec** (median of 9 runs, spread 52.7%) at 4 workers × 4 concurrent clients; scales 533k → 1.19M → 1.68M as clients are added (`benchmark_results.txt`) |
+| **Gateway ingest** | **2.06M orders/sec** (median of 9 runs, spread 19.4%) at 4 workers × 4 concurrent clients; scales 481k → 1.09M → 2.06M as clients are added (`benchmark_results.txt`) |
 | **Gateway Ingest Path** | `epoll_wait` **~54**, `read` **~117**, Decode **~162**, Validate **~53**, Enqueue **~536** (Allocate **~166**, Record **~47**, Push **~229**), Egress drain **~18** — **~946 cycles/order** total (ingest path only, *not* the matching engine) |
 | **End-to-End Latency** | `TODO(measure)` — `SCHED_FIFO` is now granted here and made things *worse* ([`docs/scheduling.md`](./docs/scheduling.md)); the blocker is `isolcpus`, not privilege |
 
@@ -25,16 +25,23 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 > measuring the audit logger, not the exchange. `engine_orders_in` is incremented by
 > the matching engine itself, on its own cache line, per shard.
 >
-> **This ceiling is the load generator, not the exchange.** At the 1.68M operating
+> **This ceiling is the load generator, not the exchange.** At the 2.06M operating
 > point the gateway is **~48% idle** and the engine shards are **~89% idle** — both
 > sit in their empty-poll branches waiting for work. Firm and exchange share one
-> laptop; the exchange is pinned to the P-cores (`EXCHANGE_CPUSET`, default `0-7`),
-> so the `tester` processes run on E-cores and cannot produce TCP traffic fast enough
-> to saturate a gateway that costs ~950 cycles/order. Ingest was still climbing at
-> four clients — it has not saturated, and the number is a floor for this box, not a
-> ceiling for the design. The 1→2 client spreads (12.9% / 7.2%) are tight; the
-> 4-client spread is 52.7%, so treat 1.68M as "clearly above 1.19M" rather than as a
-> precise figure.
+> laptop; the exchange is pinned to the P-cores (`EXCHANGE_CPUSET`, default `0-10`)
+> and the `tester` processes to the E-cores (`TESTER_CPUSET`, default `11-15`), so
+> the generators cannot produce TCP traffic fast enough to saturate a gateway that
+> costs ~950 cycles/order. Ingest was still climbing at four clients — it has not
+> saturated, and the number is a floor for this box, not a ceiling for the design.
+>
+> **The jump from the previously published 1.68M is a harness fix, not an engine
+> improvement.** The load generators used to run unpinned and competed with the
+> exchange for the very P-cores under measurement; pinning them off those cores is
+> worth +31% at four clients on its own and cut the 4-client spread from 52.7% to
+> 19.4%. The same fix made the 1- and 2-client points ~9% *worse* (533k → 481k,
+> 1.19M → 1.09M) with wider spreads, because at one or two clients there is no
+> parallelism to offset running the generators on 3300 MHz E-cores. Full attribution,
+> including the arm that isolates the core map, is in `benchmark_results.txt`.
 >
 > **Per-order cycle counts are bimodal on this box, and it is SMT.** Across the nine
 > runs at 4×4, `Total/Order` splits into two clusters — five runs at 742–1056 and
@@ -45,8 +52,11 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 > on SMT siblings of the same physical core. It is **not** a free win: the same
 > change halves single-client throughput (533k → 252k) and costs 21% at two clients,
 > because four logical CPUs cannot host the exchange's ~10 threads. Per-order
-> efficiency and wall-clock throughput move in opposite directions, so `0-7` stays
-> the published configuration and the trade-off is recorded rather than resolved.
+> efficiency and wall-clock throughput move in opposite directions, so the
+> SMT-inclusive layout stays the published configuration — now `0-10`, which adds
+> E-cores 8–10 for the three cold aux threads — and the trade-off is recorded rather
+> than resolved. (Those cycle figures predate the harness fix described above; the
+> trade-off they record is unaffected, since both arms were measured the same way.)
 >
 > **Latency percentiles are deliberately still unmeasured, and `SCHED_FIFO` did not
 > fix that.** The privilege is now granted (`ulimit -r` is 80, and the exchange
@@ -68,7 +78,7 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 >
 > **Why ingest needs concurrent clients:** `SO_REUSEPORT` distributes accepted
 > *connections* across workers, so a single-socket client pins all load to one
-> worker regardless of `GATEWAY_THREADS` — measured 533k orders/s at 4
+> worker regardless of `GATEWAY_THREADS` — measured 481k orders/s at 4
 > workers with one client. Load generators must open multiple connections.
 
 ## 3. Architecture

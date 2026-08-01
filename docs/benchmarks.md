@@ -21,7 +21,9 @@ Instead, the system is intentionally stressed under massive sustained load (1,00
 *   **Memory Architecture:** Unified NUMA node
 
 ### Software
-*   **OS:** Ubuntu 24.04.3 LTS (Linux Kernel)
+*   **OS:** Fedora Linux 44, kernel 6.19.10-300.fc44.x86_64. Full inventory —
+    topology, governor, IRQ placement, realtime limits — in
+    [`machine-profile.md`](./machine-profile.md).
 *   **Compiler:** GCC / Clang, C++20. Both projects now build with the **same**
     release flags — `-O3 -march=native -flto -DNDEBUG` and `-Wall -Wextra -Werror
     -Wpedantic` (unified in Phase 0.1; the engine previously carried no flags of its
@@ -92,17 +94,32 @@ trusting the client's reported rate — `send()` returns once the data is buffer
 client-side "throughput" is offered load, not work the engine did. (The tester
 happily reports ~2.6M orders/s while the engine consumes ~0.2M.)
 
-| Gateway workers | Concurrent clients | Ingest (orders/sec) |
-| ---: | ---: | ---: |
-| 4 | 1 | ~533,000 |
-| 4 | 2 | ~1,186,000 |
-| 4 | 4 | **~1,676,000** |
+| Gateway workers | Concurrent clients | Ingest (orders/sec) | Spread |
+| ---: | ---: | ---: | ---: |
+| 4 | 1 | ~481,000 | 38% |
+| 4 | 2 | ~1,095,000 | 72% |
+| 4 | 4 | **~2,062,000** | 19% |
 
-Two things fall out of this:
+Three things fall out of this:
 
 **`SO_REUSEPORT` shards by connection, not by packet.** A single client pins all load to one worker regardless of `GATEWAY_THREADS`. Multi-connection load is a prerequisite for gateway scaling, and any load generator that opens one socket will silently measure a single worker.
 
-**Ingest is load-generator-bound at 1.68M orders/sec.** The measurement at 4 concurrent clients is the point where the `tester` instances saturate this host's ability to *generate* load — the gateway is ~48% idle and the engine shards ~89% idle at that point — rather than the true ceiling of the engine.
+**Ingest is load-generator-bound at 2.06M orders/sec.** The measurement at 4 concurrent clients is the point where the `tester` instances saturate this host's ability to *generate* load — the gateway is ~48% idle and the engine shards ~89% idle at that point — rather than the true ceiling of the engine.
+
+**The benchmark used to measure itself.** These figures replace an earlier
+533k/1.19M/1.68M sweep, and the difference is a harness fix rather than an engine
+change. That harness never applied `config.env` — only the bash entry points source it,
+so the exchange silently ran on the fallbacks in `exchange.cpp`, with `GATEWAY_CORES`
+unset and therefore the gateway workers unpinned. The `tester` processes were unpinned
+too, so the load generators competed with the exchange for the very P-cores under
+measurement. Pinning them off those cores (`TESTER_CPUSET`, default `11-15`) accounts for
+the entire gain: +31% at four clients, with run-to-run spread falling 77% → 19%. It also
+made the 1- and 2-client points ~9% *worse*, because with one or two generators there is
+no parallelism to offset running them at 3300 MHz. The corrected core map, measured on
+its own, was within noise (−6% against a 35–101% spread). Per-arm attribution is recorded
+in `benchmark_results.txt`.
+
+> The 4×2 spread is 72%. Treat that median as indicative only.
 
 > **This is a lower bound, not a capacity figure.** The run had no `SCHED_FIFO`
 > privilege, a `powersave` governor, and other applications running; the environment
@@ -167,10 +184,12 @@ this run is `TODO(measure)`.
 remain design predictions — this box cannot measure them, see the `SCHED_FIFO` note.*
 
 1. **Single-connection ceiling is real, but it is not an `epoll` limit.** A single
-   client tops out near 207–215k orders/sec whether the gateway runs 1 or 4 workers.
+   client tops out near **481k orders/sec** whether the gateway runs 1 or 4 workers.
    The cause is connection-level sharding, not the ingestion loop: `SO_REUSEPORT`
    pins an accepted connection to one worker. Concurrency has to come from
-   connections.
+   connections. (This line previously read "207–215k", a figure that predated both
+   the bottleneck fixes and the move to the `engine_orders_in` counter, and which
+   contradicted the sweep table above it.)
 2. **Queueing Delay Dominates Latency:** under saturation the engine logic is expected
    to stay flat while TCP queueing delay balloons — queueing, not execution, dictating
    end-to-end latency. Unverified here (`TODO(measure)`).
@@ -178,24 +197,29 @@ remain design predictions — this box cannot measure them, see the `SCHED_FIFO`
    queueing delay substantially. Its *throughput* effect is confirmed (5× from 1 to 4
    clients); its *latency* effect is `TODO(measure)`.
 4. **The 4-Thread Operating Point:** four gateway threads with four concurrent clients
-   reaches **1.68M orders/sec** (median of 9 runs, 52.7% spread) on this machine.
+   reaches **2.06M orders/sec** (median of 9 runs, 19.4% spread) on this machine.
    Ingest is *still climbing* at four clients — this is not a saturation point, it is
    as far as one laptop can drive it while also hosting the load generators.
-5. **The measured ceiling is the load generator.** At the 1.68M point the gateway is
+5. **The measured ceiling is the load generator.** At the 2.06M point the gateway is
    ~48% idle and the engine shards are ~89% idle, both parked in their empty-poll
-   branches. The exchange is pinned to the P-cores, so the `tester` processes run
-   on E-cores and cannot generate TCP traffic fast enough to feed a gateway that costs
+   branches. The exchange is pinned to the P-cores and the `tester` processes to the
+   E-cores, which cannot generate TCP traffic fast enough to feed a gateway that costs
    ~950 cycles/order. An earlier note here claimed ingest *fell* from 4 to 8 clients
    (1.08M → 1.07M); that was measured through the `orders_in` counter, which sits
    downstream of the engine and was throttled by the OrderManager. It is withdrawn.
+6. **Where the load generators run is part of the measurement.** Leaving them unpinned
+   cost 31% at four clients and tripled the run-to-run spread, purely by contending
+   with the exchange for the cores being measured. A benchmark that does not place its
+   own load generator is measuring the placement, not the system.
 
 ## Conclusions
 The functional goal — a documented run that actually matches orders through the full
 pipeline — is met (`results.txt`: 4 threads, 10,000 orders, 20,000 fills, 0 rejects).
-Gateway ingest is measured at **1.68M orders/sec** on a developer desktop
-(`benchmark_results.txt`), scaling 533k → 1.19M → 1.68M with concurrent connections and
-still climbing at four. The latency campaign stays open: it needs a box that can grant
-`SCHED_FIFO`.
+Gateway ingest is measured at **2.06M orders/sec** on a developer desktop
+(`benchmark_results.txt`), scaling 481k → 1.09M → 2.06M with concurrent connections and
+still climbing at four. The latency campaign stays open — and it now needs isolated
+cores rather than merely `SCHED_FIFO` privilege, which is granted here and makes
+throughput worse ([`scheduling.md`](./scheduling.md)).
 
 The design thesis is supported, but the numbers behind it have changed: application-side
 work per order is small and stable (~162/53/536 cycles for decode/validate/enqueue) and
