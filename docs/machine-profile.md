@@ -180,13 +180,39 @@ Fixing this is a prerequisite for the `isolcpus` work, not a separate cleanup.
 
 ## What this machine cannot measure
 
+- **Any effect smaller than roughly 30%.** This is the binding limitation, and it is
+  easy to miss because it is not about the ceiling — it is about resolution. Measured
+  run-to-run spread across four 9-run arms was 13–101%, most points landing at 35–75%:
+
+  | Arm | 4×1 | 4×2 | 4×4 |
+  | --- | ---: | ---: | ---: |
+  | baseline | 13% | 7% | 53% |
+  | corrected map + pinned generators | 38% | 72% | 19% |
+  | corrected map, generators free | 35% | **101%** | 77% |
+  | gateway unpinned | 66% | 66% | 64% |
+
+  Concretely: the corrected core map measured −6%, which is indistinguishable from zero
+  here, so it was published as "no measured effect" rather than as a number. Pinning the
+  load generators measured +31% and *did* clear the floor. Most worthwhile optimisations
+  to this engine land in the 5–20% band — below this box's resolution entirely.
 - **Latency percentiles.** No `isolcpus`, a scaling governor that reverts itself, and RT
   throttling against a busy-poll engine. p99/p99.9 here describe the Linux scheduler.
 - **True ingest ceiling.** The load generators share the box with the exchange; at the
   published operating point the gateway is ~48% idle and the engine shards ~89% idle.
-- **Anything about real NICs.** Loopback only.
+- **Anything about real NICs.** Loopback only, 65536 MTU, no driver and no interrupts —
+  so the `t4→t5` "TCP path" is a memcpy through the kernel, and the kernel-bypass case
+  (DPDK / `ef_vi`) is not merely unmeasured here but unevaluable.
+- **Whether `SCHED_FIFO` helps the *design*.** [`scheduling.md`](./scheduling.md) records
+  that it hurts *this box* by 59% at one client. That is a statement about 4 physical
+  cores hosting 11 realtime threads, not about realtime scheduling. On a machine with
+  more isolated cores than realtime threads the conclusion may well invert.
 - **Sustained all-core clocks.** Battery power plus a laptop thermal envelope.
 
-What it *can* measure reliably: per-order cycle counts (TSC is invariant), relative
-throughput between configurations under identical settings, correctness under ASan/TSan,
+What it *can* measure reliably: per-order cycle counts (TSC is invariant, so cycle deltas
+are real work rather than frequency scaling), **large** relative differences between
+configurations run back-to-back under identical settings, correctness under ASan/TSan,
 and the shape of scaling curves.
+
+The practical rule this yields: use this box to answer *"did that make things better or
+worse"* when the change is big, and do not use it to answer *"by how much"* — or to
+answer anything at all when the change is small.
