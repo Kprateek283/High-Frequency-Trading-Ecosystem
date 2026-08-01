@@ -42,3 +42,4 @@ void test_pool_recycle_concurrency();
         std::printf("ok\n");                                                   \
     } while (0)
 void test_ack_coalescing();
+void test_realtime();

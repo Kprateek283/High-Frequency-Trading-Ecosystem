@@ -372,14 +372,39 @@ down with them.
 
 None — and that is the entry. **Cycles/order and orders/second are different quantities,
 and here they move in opposite directions.** Optimising the first would have made the
-system worse at the second. `0-7` remains the published configuration because throughput is
-what the benchmark claims to measure; the efficiency win is recorded and left on the table.
+system worse at the second. The SMT-inclusive layout remains the published configuration
+because throughput is what the benchmark claims to measure; the efficiency win is recorded
+and left on the table. (`EXCHANGE_CPUSET` has since defaulted to `0-10` rather than `0-7`,
+which adds E-cores 8–10 for the three cold aux threads and leaves the P-core layout under
+test here unchanged. Both arms above were measured on the pre-`config.env` harness — see
+`benchmark_results.txt` — so their absolute numbers predate the current sweep, but the
+comparison between them holds.)
 
 An earlier draft of this measurement ran six iterations at the 4×4 point only, saw
 1.95M vs 1.68M, and concluded physical-core pinning was a 16% win. Nine runs across the
 full client sweep withdrew it. The failure mode is the one this document already records
 twice: a real effect, measured at one operating point, generalised to a claim the data did
 not cover.
+
+### Postscript — the bimodality does not reproduce
+
+Nine fresh runs after the harness fix (`config.env` actually applied, load generators
+pinned off the measured cores, corrected core map) measure `Total/Order` at **398–500,
+unimodal, median 433** — against 742–1861 bimodal before. The two clusters are gone, and
+so is roughly half the absolute cost.
+
+The SMT reasoning above is not withdrawn: two workers sharing one core's execution ports
+*would* produce exactly that signature, and the `0,2,4,6` arm did remove the high cluster.
+But the fresh data admits a second explanation that was not controlled for. `__rdtscp`
+counts **elapsed** cycles, not retired instructions, so an unpinned load generator
+competing for the same physical core inflates "cycles/order" without the gateway executing
+anything extra — and until the harness fix, the generators were doing exactly that on
+every run.
+
+Two variables moved together here (generator placement and the core map), so this is
+recorded as **not attributed**. What can be said: the bimodality was at least partly a
+measurement artifact rather than purely a property of the code, and any future use of
+these counters has to control generator placement first.
 
 ---
 

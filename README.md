@@ -11,9 +11,9 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 | **Functional run** | 4-thread gateway matches orders end-to-end: 10,000 orders → 20,000 fills, **0 rejects** (`results.txt`) |
 | **Gateway Architecture** | 4-thread `SO_REUSEPORT` sharding |
 | **Latency probes** | 5-point `__rdtscp` decomposition (4 on-wire + gateway ingress) |
-| **Gateway ingest** | **1.68M orders/sec** (median of 9 runs, spread 52.7%) at 4 workers × 4 concurrent clients; scales 533k → 1.19M → 1.68M as clients are added (`benchmark_results.txt`) |
-| **Gateway Ingest Path** | `epoll_wait` **~54**, `read` **~117**, Decode **~162**, Validate **~53**, Enqueue **~536** (Allocate **~166**, Record **~47**, Push **~229**), Egress drain **~18** — **~946 cycles/order** total (ingest path only, *not* the matching engine) |
-| **End-to-End Latency** | `TODO(measure)` — needs a box where `SCHED_FIFO` is grantable; see below |
+| **Gateway ingest** | **2.06M orders/sec** (median of 9 runs, spread 19.4%) at 4 workers × 4 concurrent clients; scales 481k → 1.09M → 2.06M as clients are added (`benchmark_results.txt`) |
+| **Gateway Ingest Path** | `epoll_wait` **41**, `read` **41**, Decode **95**, Validate **17**, Enqueue **228** (Allocate **80**, Record **19**, Push **84**), Egress drain **12** — **433 cycles/order** total, median of 9 runs (ingest path only, *not* the matching engine). These are *elapsed* cycles from `__rdtscp`, so they include stalls and contention — see [`benchmarks.md`](./docs/benchmarks.md) |
+| **End-to-End Latency** | `TODO(measure)` — `SCHED_FIFO` is now granted here and made things *worse* ([`docs/scheduling.md`](./docs/scheduling.md)); the blocker is `isolcpus`, not privilege |
 
 > **Read the throughput number with its caveat.** It was measured by
 > [`scripts/measure_throughput.py`](./scripts/measure_throughput.py), which samples
@@ -25,34 +25,49 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 > measuring the audit logger, not the exchange. `engine_orders_in` is incremented by
 > the matching engine itself, on its own cache line, per shard.
 >
-> **This ceiling is the load generator, not the exchange.** At the 1.68M operating
-> point the gateway is **~48% idle** and the engine shards are **~89% idle** — both
+> **This ceiling is the load generator, not the exchange.** At the 2.06M operating
+> point the gateway is **~87% idle** and the engine shards are **~96% idle** — both
 > sit in their empty-poll branches waiting for work. Firm and exchange share one
-> laptop; the exchange is pinned to the P-cores (`EXCHANGE_CPUSET`, default `0-7`),
-> so the `tester` processes run on E-cores and cannot produce TCP traffic fast enough
-> to saturate a gateway that costs ~950 cycles/order. Ingest was still climbing at
-> four clients — it has not saturated, and the number is a floor for this box, not a
-> ceiling for the design. The 1→2 client spreads (12.9% / 7.2%) are tight; the
-> 4-client spread is 52.7%, so treat 1.68M as "clearly above 1.19M" rather than as a
-> precise figure.
+> laptop; the exchange is pinned to the P-cores (`EXCHANGE_CPUSET`, default `0-10`)
+> and the `tester` processes to the E-cores (`TESTER_CPUSET`, default `11-15`), so
+> the generators cannot produce TCP traffic fast enough to saturate a gateway that
+> costs ~433 cycles/order. Ingest was still climbing at four clients — it has not
+> saturated, and the number is a floor for this box, not a ceiling for the design.
 >
-> **Per-order cycle counts are bimodal on this box, and it is SMT.** Across the nine
-> runs at 4×4, `Total/Order` splits into two clusters — five runs at 742–1056 and
-> three at 1601–1861 — while the calibrated TSC stays at 2.11 cycles/ns throughout.
-> A constant TSC means those are real extra cycles, not the governor. Re-pinning to
-> one thread per physical P-core (`EXCHANGE_CPUSET=0,2,4,6`) removes the high cluster
-> (median 946 → 697 cycles/order, max 1097), which points at gateway workers landing
-> on SMT siblings of the same physical core. It is **not** a free win: the same
-> change halves single-client throughput (533k → 252k) and costs 21% at two clients,
-> because four logical CPUs cannot host the exchange's ~10 threads. Per-order
-> efficiency and wall-clock throughput move in opposite directions, so `0-7` stays
-> the published configuration and the trade-off is recorded rather than resolved.
+> **The jump from the previously published 1.68M is a harness fix, not an engine
+> improvement.** The load generators used to run unpinned and competed with the
+> exchange for the very P-cores under measurement; pinning them off those cores is
+> worth +31% at four clients on its own and cut the 4-client spread from 52.7% to
+> 19.4%. The same fix made the 1- and 2-client points ~9% *worse* (533k → 481k,
+> 1.19M → 1.09M) with wider spreads, because at one or two clients there is no
+> parallelism to offset running the generators on 3300 MHz E-cores. Full attribution,
+> including the arm that isolates the core map, is in `benchmark_results.txt`.
 >
-> **Latency percentiles are deliberately still unmeasured.** Tail latency is
-> precisely what arbitrary preemption destroys, and this box cannot grant
-> `SCHED_FIFO` (`ulimit -r` is 0), so p99/p99.9 figures from it would be
-> measuring the scheduler, not the engine. Publishing them would repeat the
-> mistake this project already corrected once.
+> **Per-order cycle counts used to be bimodal, and no longer are.** Under the old
+> harness, `Total/Order` across nine runs split into two clusters — five at 742–1056
+> and three at 1601–1861 — and that was attributed to gateway workers landing on SMT
+> siblings ([`docs/bottlenecks.md`](./docs/bottlenecks.md) §10). Nine fresh runs
+> measure 398–500, unimodal, median 433. The split is gone, and so is roughly half
+> the absolute cost. Two things changed at once — the load generators moved off the
+> measured cores, and the core map was corrected — so **which one dissolved the
+> bimodality is not attributed**, though generator contention is the likelier
+> candidate given `__rdtscp` counts elapsed cycles rather than retired instructions.
+> The recorded trade-off from that analysis (per-order efficiency and wall-clock
+> throughput move in opposite directions, so the SMT-inclusive layout — now `0-10` —
+> stays published) is unaffected: both of its arms were measured the same way.
+>
+> **Latency percentiles are deliberately still unmeasured, and `SCHED_FIFO` did not
+> fix that.** The privilege is now granted (`ulimit -r` is 80, and the exchange
+> verifies per run that it got it: `RT_SCHED: granted=11/11 priority=80`). Realtime
+> scheduling turned out to be **59% slower** at one client, because `SCHED_FIFO` never
+> preempts a same-priority peer and the engine busy-spins — four shards hold four CPUs
+> permanently while eleven realtime threads contend for eight logical ones. RT
+> throttling then adds a ~50 ms deschedule every second, which alone would dominate any
+> p99.9. The full comparison and the three mechanisms behind it are in
+> [`docs/scheduling.md`](./docs/scheduling.md); the machine itself is described in
+> [`docs/machine-profile.md`](./docs/machine-profile.md). The real blocker is
+> `isolcpus`, not privilege. Publishing a tail from this box would repeat the mistake
+> this project already corrected once.
 >
 > Earlier headline numbers were measured on an unoptimised engine running a reject
 > loop (see [`docs/review-findings.md`](./docs/review-findings.md) A1/A2/B9) and were
@@ -61,7 +76,7 @@ The project models both sides of a trading venue: a Trading Firm Simulator and a
 >
 > **Why ingest needs concurrent clients:** `SO_REUSEPORT` distributes accepted
 > *connections* across workers, so a single-socket client pins all load to one
-> worker regardless of `GATEWAY_THREADS` — measured 533k orders/s at 4
+> worker regardless of `GATEWAY_THREADS` — measured 481k orders/s at 4
 > workers with one client. Load generators must open multiple connections.
 
 ## 3. Architecture
@@ -110,6 +125,8 @@ We treat documentation as a first-class citizen. Detailed technical deep-dives a
 *   [**Benchmarks & Capacity (`docs/benchmarks.md`)**](./docs/benchmarks.md): The 5-point latency decomposition, gateway CPU cycle attribution, the measured ingest sweep, and what is still `TODO(measure)` pending reference hardware.
 *   [**Benchmark Setup (`docs/benchmark-setup.md`)**](./docs/benchmark-setup.md): The three OS prerequisites (`SCHED_FIFO`, `performance` governor, `isolcpus`) that turn the lower-bound numbers into publishable ones — no code changes, environment only.
 *   [**Technical Deep Dive (`docs/technical-deep-dive.md`)**](./docs/technical-deep-dive.md): Lock-Free SPSC Queues, false-sharing mitigation, Memory Pools, and atomic memory barriers.
+*   [**Scheduling: SCHED_OTHER vs SCHED_FIFO (`docs/scheduling.md`)**](./docs/scheduling.md): A measured negative result — realtime scheduling is 59% *slower* on this box, why (FIFO does not timeslice equal priorities, and the engine busy-spins), and what has to be true before it wins.
+*   [**Machine Profile (`docs/machine-profile.md`)**](./docs/machine-profile.md): The one laptop every number here was measured on — hybrid P/E topology, what it cannot measure, and why `config.env`'s core map is currently misaligned with the hardware.
 *   [**Engineering Bottlenecks (`docs/bottlenecks.md`)**](./docs/bottlenecks.md): Challenges faced, including the TCP queueing-delay saturation, the EBADF epoll spin-loop, and the SIGBUS on the mmap'd audit log.
 *   [**Telemetry Pipeline (`docs/telemetry.md`)**](./docs/telemetry.md): Using x86 hardware intrinsics to bypass `clock_gettime` overhead.
 
@@ -233,7 +250,7 @@ The harness is complete and needs no code changes — only a box configured for
 deterministic execution. Set the three OS prerequisites once
 ([`docs/benchmark-setup.md`](./docs/benchmark-setup.md)):
 
-1. **`SCHED_FIFO`** — `ulimit -r unlimited` (else real-time pinning silently degrades).
+1. **`SCHED_FIFO`** — install `scripts/99-hft-realtime.conf` into `/etc/security/limits.d/` and re-login (`ulimit -r` cannot raise its own hard limit). Else real-time pinning silently degrades; the exchange prints `RT_SCHED: granted=N/M` so you can tell.
 2. **`performance` governor** — `sudo cpupower frequency-set -g performance`.
 3. **`isolcpus`** — isolate the engine's cores (1–8, per `config.env`) via GRUB + reboot.
 

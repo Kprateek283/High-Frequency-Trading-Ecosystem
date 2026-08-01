@@ -1,27 +1,99 @@
-# Gateway ingest sweep  2026-07-31T20:23:16Z
-# cores=16 load1=0.58 governor=powersave rtprio_limit=0 isolcpus=none exchange_cpuset=0-7
+# Gateway ingest sweep  2026-08-01T11:20:42Z
+# cores=16 load1=0.94 governor=powersave rtprio_limit=80 isolcpus=none exchange_cpuset=0-10 tester_cpuset=11-15
+# core map: GATEWAY_CORES=1,3,5,7 ENGINE_CORES=0,2,4,6 AUX_CORES=8,9,10
+# realtime (achieved by the exchange, not promised by ulimit): RT_SCHED: granted=0/0 priority=0
 # orders/s measured from stats-region engine_orders_in (incremented by the matching engine itself, not the downstream OrderManager) over a 1.5s window, 9 runs per point (median reported)
 #
 # workers  clients  median_orders_per_s  spread_pct
-        4        1               533282       12.9
-        4        2              1185907        7.2
-        4        4              1675517       52.7
+        4        1               480935       38.1
+        4        2              1094665       71.9
+        4        4              2061838       19.4
 #
 # WARNING: this run had no SCHED_FIFO privilege and/or a scaling
 # governor. Treat the shape (does it scale?) as meaningful and the
 # absolute ceiling as a lower bound for this box only.
 #
-# Same sweep re-run at 2026-07-31T20:55:22Z with EXCHANGE_CPUSET=0,2,4,6 --
-# one thread per physical P-core instead of all eight SMT threads, 9 runs
-# per point:
+# ---------------------------------------------------------------------------
+# WHAT CHANGED SINCE THE PREVIOUS PUBLISHED SWEEP (2026-07-31T20:23:16Z)
 #
-#        4        1               251894       47.3
-#        4        2               939927       10.1
-#        4        4              1828434       64.5
+# The previous numbers were measured through a harness that never applied
+# config.env, so the exchange ran on the fallbacks in exchange.cpp and, with
+# GATEWAY_CORES unset, did not pin its gateway workers at all. The load
+# generators were also unpinned and competed with the exchange for the P-cores
+# under measurement. Both are fixed; these are not the same measurement, so the
+# rows are not directly comparable to the old ones.
 #
-# Restricting the exchange to physical cores lowers median cycles/order
-# (946 -> 697) but halves single-client throughput and costs 21% at two
-# clients; the 4-client points overlap well inside their spreads (52.7% and
-# 64.5%). Per-order efficiency and wall-clock throughput move in opposite
-# directions here, so 0-7 remains the published configuration.
-# See docs/bottlenecks.md "SMT siblings".
+#   workers  clients   old harness    this run
+#         4        1       533282      480935
+#         4        2      1185907     1094665
+#         4        4      1675517     2061838
+#
+# Attribution, from four arms at 9 runs each (all RT_PRIORITY=0, powersave):
+#
+#   Core map (shard 3 off the E-core, engine_i paired with gateway_i):
+#     -6% at every point, against a 35-101% run-to-run spread. Within noise.
+#     Kept for correctness and as an isolcpus prerequisite, NOT as a speedup.
+#
+#   Pinning the load generators off the measured cores (TESTER_CPUSET=11-15):
+#     1,577,627 -> 2,061,838 at four clients (+31%), spread 77% -> 19%. This is
+#     the whole of the gain above. The falling spread is corroboration: the
+#     measurement became more repeatable, which is what removing contention
+#     between the generator and the thing it measures should do.
+#
+# The 4x1 and 4x2 rows REGRESSED ~9% against the old harness and their spread
+# rose (13% -> 38%, 7% -> 72%). With one or two testers there is no parallelism
+# to offset running them on 3300 MHz E-cores. If the single-client figure is the
+# one being optimised, TESTER_CPUSET wants revisiting -- it is tuned for the
+# four-client point.
+#
+# A fourth arm left GATEWAY_CORES unset (gateway unpinned) and measured
+# 246003 / 934020 / 1599904. That looks like a catastrophic case for unpinning,
+# but it is confounded: EXCHANGE_CPUSET=0-10 lets unpinned workers drift onto
+# E-cores 8-10, which the old 0-7 cpuset prevented. Direction is real, magnitude
+# is not trustworthy. Not used for any claim here.
+#
+# Caveat on 4x2: 71.9% spread. Treat that median as indicative only.
+# ---------------------------------------------------------------------------
+#
+# ---------------------------------------------------------------------------
+# EARLIER RESULT, MEASURED ON THE OLD HARNESS (both arms, so still internally
+# consistent -- but its absolute numbers predate the config.env fix above).
+#
+# SCHED_FIFO was granted and measured. It is SLOWER on this box, which is why
+# every sweep published in this file, old harness and new, is SCHED_OTHER.
+#
+# /etc/security/limits.d/99-hft-realtime.conf now grants rtprio 80, and the
+# exchange confirms per run that it actually got it (RT_SCHED: granted=11/11
+# priority=80). Same governor (powersave), same cpuset, 9 runs per point,
+# measured 2026-07-31T23:45:11Z:
+#
+#   workers  clients   SCHED_OTHER      SCHED_FIFO 80
+#         4        1       533282    218716  (-59%, spread 10% -> 95%)
+#         4        2      1185907    882715  (-26%, spread 13% -> 86%)
+#         4        4      1675517   1601272  ( -4%, spread 53% -> 37%)
+#
+# Cause is structural, not a bug. The exchange runs 11 threads that request
+# realtime; EXCHANGE_CPUSET=0-7 is 8 logical CPUs; isolcpus is not configured.
+# Under SCHED_OTHER, CFS timeslices 11 runnable threads across 8 CPUs. Under
+# SCHED_FIFO at equal priority a thread is never preempted by a same-priority
+# peer -- it runs until it blocks or the RT throttle fires -- and the engine
+# never blocks (engine.cpp spins on __builtin_ia32_pause). Four shards therefore
+# hold four CPUs indefinitely while the other seven RT threads fight over what is
+# left. kernel.sched_rt_runtime_us=950000 then adds a ~50 ms deschedule per
+# second on top of that.
+#
+# SCHED_FIFO only pays off once the RT threads have cores to themselves:
+# isolcpus for the hot path, threads <= isolated CPUs, and a decision on
+# sched_rt_runtime_us. Until then, benchmark with RT_PRIORITY=0.
+# See docs/benchmark-setup.md section 1.
+#
+# An earlier RT run also showed that PARTIAL realtime is worse than none: with
+# GATEWAY_CORES unset the gateway workers returned before requesting RT, so the
+# spinning engine shards ran at priority 80 while their producers stayed at
+# SCHED_OTHER on the same cpuset. That inversion cost 4x1 ingest 533k -> 264k at
+# 96% spread. Fixed -- affinity and scheduling policy are now independent.
+#
+# Note on the governor: `tuned` is active and this laptop was on battery, so it
+# reverted scaling_governor to powersave between being set to performance and
+# the sweep running. Both sweeps compared above are powersave, so the comparison
+# holds, but a performance-governor run needs tuned disabled or AC power.

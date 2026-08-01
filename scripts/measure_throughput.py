@@ -38,9 +38,25 @@ BIN = next((d for d in (f"{ROOT}/build/bin", f"{ROOT}/build")
 SWEEP = ((4, 1), (4, 2), (4, 4))
 RUNS = 9
 WINDOW_S = 1.5
+RUN_TIMEOUT_S = 240       # watchdog per run; generous vs the 180s drain wait below
 # Which CPUs the exchange is pinned to. "0-7" is the four P-cores *including*
-# their SMT siblings; "0,2,4,6" is one thread per physical P-core.
-CPUSET = os.environ.get("EXCHANGE_CPUSET", "0-7")
+# their SMT siblings; "0,2,4,6" is one thread per physical P-core. The default
+# extends to 10 because AUX_CORES puts the three cold threads on E-cores 8-10 --
+# taskset's mask is a hard ceiling, so a pin outside it just fails.
+CPUSET = os.environ.get("EXCHANGE_CPUSET", "0-10")
+# Where the load generators run. Unpinned testers float across all 16 CPUs and
+# compete with the exchange for the very P-cores being measured.
+TESTER_CPUSET = os.environ.get("TESTER_CPUSET", "11-15")
+RT_STATUS = []            # one "RT_SCHED: granted=N/M priority=P" per run
+
+# The core map has to be pushed into the child's environment explicitly. The C++
+# side reads GATEWAY_CORES/ENGINE_CORES/AUX_CORES with getenv(), and only the
+# bash entry points (`run_sharding.sh`, `multi_firm_run.sh`) `source config.env`.
+# Python inherits os.environ, which does NOT contain them -- so before this,
+# every sweep silently ran on the hardcoded fallbacks in exchange.cpp/tcp_server.h,
+# where an unset GATEWAY_CORES means the gateway workers are not pinned at all.
+CFG = Config()
+CORE_ENV = {k: CFG.get(k) for k in ("GATEWAY_CORES", "ENGINE_CORES", "AUX_CORES")}
 
 
 def _read(path, default="n/a"):
@@ -65,20 +81,36 @@ def environment():
         "rtprio_limit": rt,                                 # 0 => no SCHED_FIFO
         "isolcpus": isol[0].split("=", 1)[1] if isol else "none",
         "cpuset": CPUSET,
+        "tester_cpuset": TESTER_CPUSET,
+        "cores_env": " ".join(f"{k}={v}" for k, v in CORE_ENV.items()),
     }
 
 
 def one_run(workers, clients):
-    env = dict(os.environ, GATEWAY_THREADS=str(workers),
+    env = dict(os.environ, **CORE_ENV, GATEWAY_THREADS=str(workers),
                AUDIT_LOG_PATH="/dev/shm/measure_audit.log")
-    eng = subprocess.Popen(["taskset", "-c", CPUSET, f"{BIN}/exchange"], cwd=ROOT, env=env,
+    # `timeout` is a watchdog, not a schedule. A run that wedges -- which is a real
+    # possibility with RT_PRIORITY>0, where SCHED_FIFO shards busy-spin and cannot
+    # be preempted by the harness trying to stop them -- dies on its own instead of
+    # taking the machine with it. A healthy run is killed by SIGINT long before this.
+    eng = subprocess.Popen(["timeout", "-s", "INT", "-k", "10", str(RUN_TIMEOUT_S),
+                            "taskset", "-c", CPUSET, f"{BIN}/exchange"],
+                           cwd=ROOT, env=env,
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    rt_line = "RT_SCHED: not reported"
     for line in eng.stdout:                                 # the I8 READY barrier
+        if line.startswith("RT_SCHED:"):
+            # What the exchange actually got, not what `ulimit -r` promised. The
+            # exchange's stderr goes to /dev/null, so before this existed a run
+            # whose threads all failed to reach SCHED_FIFO looked identical to
+            # one where they succeeded.
+            rt_line = line.strip()
         if line.strip() == "READY":
             break
+    RT_STATUS.append(rt_line)
 
     reader = StatsReader(Config().get_path("STATS_SHM_PATH"))
-    procs = [subprocess.Popen([f"{BIN}/tester"], cwd=ROOT,
+    procs = [subprocess.Popen(["taskset", "-c", TESTER_CPUSET, f"{BIN}/tester"], cwd=ROOT,
                               env=dict(env, TARGET_RATE="0", WORKLOAD_TYPE="2"),
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
              for _ in range(clients)]
@@ -113,7 +145,10 @@ def main():
     lines = [f"# Gateway ingest sweep  {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
              f"# cores={env['cores']} load1={env['load_1min']:.2f} "
              f"governor={env['governor']} rtprio_limit={env['rtprio_limit']} "
-             f"isolcpus={env['isolcpus']} exchange_cpuset={env['cpuset']}",
+             f"isolcpus={env['isolcpus']} exchange_cpuset={env['cpuset']} "
+             f"tester_cpuset={env['tester_cpuset']}",
+             f"# core map: {env['cores_env']}",
+             "# realtime: PENDING",      # filled in after the sweep, from the runs
              "# orders/s measured from stats-region engine_orders_in (incremented by "
              "the matching engine itself, not the downstream OrderManager) over a "
              f"{WINDOW_S}s window, {RUNS} runs per point (median reported)",
@@ -128,6 +163,13 @@ def main():
         row = f"{workers:9d}  {clients:7d}  {median:19.0f}  {spread:9.1f}"
         print(row)
         lines.append(row)
+
+    # What the exchange actually achieved, not what ulimit promised. If any run
+    # differed, say so rather than reporting one of them.
+    seen = sorted(set(RT_STATUS))
+    lines[lines.index("# realtime: PENDING")] = (
+        "# realtime (achieved by the exchange, not promised by ulimit): "
+        + (" | ".join(seen) if seen else "n/a"))
 
     if env["rtprio_limit"] == 0 or env["governor"] not in ("performance",):
         lines += ["#",
