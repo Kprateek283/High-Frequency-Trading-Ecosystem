@@ -110,6 +110,8 @@ We treat documentation as a first-class citizen. Detailed technical deep-dives a
 *   [**Benchmarks & Capacity (`docs/benchmarks.md`)**](./docs/benchmarks.md): The 5-point latency decomposition, gateway CPU cycle attribution, the measured ingest sweep, and what is still `TODO(measure)` pending reference hardware.
 *   [**Benchmark Setup (`docs/benchmark-setup.md`)**](./docs/benchmark-setup.md): The three OS prerequisites (`SCHED_FIFO`, `performance` governor, `isolcpus`) that turn the lower-bound numbers into publishable ones — no code changes, environment only.
 *   [**Technical Deep Dive (`docs/technical-deep-dive.md`)**](./docs/technical-deep-dive.md): Lock-Free SPSC Queues, false-sharing mitigation, Memory Pools, and atomic memory barriers.
+*   [**Scheduling: SCHED_OTHER vs SCHED_FIFO (`docs/scheduling.md`)**](./docs/scheduling.md): A measured negative result — realtime scheduling is 59% *slower* on this box, why (FIFO does not timeslice equal priorities, and the engine busy-spins), and what has to be true before it wins.
+*   [**Machine Profile (`docs/machine-profile.md`)**](./docs/machine-profile.md): The one laptop every number here was measured on — hybrid P/E topology, what it cannot measure, and why `config.env`'s core map is currently misaligned with the hardware.
 *   [**Engineering Bottlenecks (`docs/bottlenecks.md`)**](./docs/bottlenecks.md): Challenges faced, including the TCP queueing-delay saturation, the EBADF epoll spin-loop, and the SIGBUS on the mmap'd audit log.
 *   [**Telemetry Pipeline (`docs/telemetry.md`)**](./docs/telemetry.md): Using x86 hardware intrinsics to bypass `clock_gettime` overhead.
 
