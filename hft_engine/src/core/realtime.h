@@ -11,10 +11,12 @@
 // which the harness captures, so the claim is checkable per run.
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <ostream>
 #include <pthread.h>
 #include <sched.h>
+#include <thread>
 
 namespace rt {
 
@@ -42,6 +44,16 @@ inline bool acquire() {
     if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) return false;
     granted().fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+// Threads call acquire() from their own start-up path, so a report printed at a
+// fixed delay after spawn races them: the same build printed granted=5/5, 6/6 and
+// 7/7 across otherwise identical runs, because the denominator was however many
+// threads happened to have arrived. Wait for the known thread count instead.
+inline void await(int expected, int timeout_ms = 2000) {
+    if (priority() == 0) return;            // nothing will ever be requested
+    for (int i = 0; i < timeout_ms && requested().load() < expected; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
 // One machine-readable line for the harness to record with the results.

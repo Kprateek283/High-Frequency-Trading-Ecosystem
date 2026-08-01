@@ -48,15 +48,22 @@ inline int core_for_worker(const char* list, int idx) {
 }
 
 inline void pin_gateway_worker(int thread_id) {
+    // Affinity and scheduling policy are independent decisions. They used to be
+    // coupled: an unset GATEWAY_CORES returned early, so the gateway workers
+    // never even *requested* SCHED_FIFO while the engine shards did. That is
+    // worse than granting neither -- the engine spins at 100% at realtime
+    // priority on the same cpuset, so the SCHED_OTHER gateway workers feeding it
+    // get starved. Measured cost of that inversion: single-client ingest halved
+    // (533k -> 264k) with the spread going from 10% to 96%.
     int core = core_for_worker(std::getenv("GATEWAY_CORES"), thread_id);
-    if (core < 0) return;           // unset/short → leave the worker where it is
-
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(core, &set);
-    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
-        std::cerr << "Warning: gateway worker " << thread_id
-                  << " could not pin to core " << core << std::endl;
+    if (core >= 0) {                // unset/short → leave the worker where it is
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(core, &set);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+            std::cerr << "Warning: gateway worker " << thread_id
+                      << " could not pin to core " << core << std::endl;
+        }
     }
     rt::acquire();      // counted; reported on stdout at READY and at shutdown
 }

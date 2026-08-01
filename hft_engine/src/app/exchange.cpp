@@ -174,6 +174,9 @@ int main() {
         std::fprintf(pf, "%d\n", getpid());
         std::fclose(pf);
     }
+    // num_gw gateway workers + NUM_SHARDS engine shards + publisher +
+    // order_manager + the gateway dispatcher, each of which calls rt::acquire().
+    rt::await(num_gw + NUM_SHARDS + 3);
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     rt::report(std::cout);      // before READY: the harness records it per run
     std::cout << "READY" << std::endl;
